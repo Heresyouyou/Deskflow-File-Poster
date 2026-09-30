@@ -56,6 +56,10 @@ Windows端/
    - `coreMode=0`（**服务端模式**，Windows 是这套 KVM 的服务端）；
    - `clipboardSharing=false` —— 有意关闭，剪贴板交给 AgentBridge；
    - `screens\N\name` 里列出对端 Mac 的屏幕名（Mac 侧须为**大写 `MAC`**）。
+     **谁的序号小谁在左**：本方案当前是 `screens\1\name=MAC` / `screens\2\name=DESKTOP-DTEKPKA`，
+     即 **Mac 在左、Windows 在右** —— Windows **左边缘**划出 → 从 Mac 的**右边缘**进入。
+     跨屏方向由服务端排布决定，客户端不用改；改法见
+     `Windows端/deskflow/01-Windows服务端配置手册.md#改鼠标从哪一侧进出`。
    - 另有一份 `deskflow-server.conf`（Barrier 风格）也带 `clipboardSharing`，
      **两份都要设为 `false`**，避免某个启动参数切换到另一份时又被打开。
 3. **信任 Mac 客户端**：若服务端开启了客户端证书校验，需把 Mac 客户端证书指纹加入

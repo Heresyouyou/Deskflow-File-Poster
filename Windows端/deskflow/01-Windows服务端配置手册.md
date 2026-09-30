@@ -15,10 +15,10 @@
 | **Server（服务端）** | Windows `192.168.10.100` | 物理键鼠插在这台机器上，由它广播输入 |
 | **Client（客户端）** | Mac `192.168.10.153` | 被动接收，光标划到边缘时接管 |
 | 服务端监听 | `0.0.0.0:24800` | Deskflow/Synergy 默认端口，TCP |
-| 服务端屏幕名 | `DESKTOP-DTEKPKA` | 布局里在**左** |
+| 服务端屏幕名 | `DESKTOP-DTEKPKA` | 布局里在**右** |
 | 客户端屏幕名 | `MAC` | **大小写敏感，必须完全一致** |
 | 通信协议 | `Barrier` | 两端必须选同一种 |
-| 布局 | Windows 在左，Mac 在右 | Windows **右边缘**划出 → 进 Mac；Mac **左边缘**划出 → 回 Windows |
+| 布局 | Mac 在左，Windows 在右 | Windows **左边缘**划出 → 进 Mac 的**右边缘**；Mac **右边缘**划出 → 回 Windows 的**左边缘** |
 | 剪贴板共享 | **关闭** | 有意为之，交给 AgentBridge |
 
 **两端必须在同一二层网络（同网段）**，这是「同网段跨屏」方案的前提。
@@ -106,8 +106,8 @@ coreMode=0
 [internalConfig]
 clipboardSharing=false
 clipboardSharingSize=3072
-screens\1\name=DESKTOP-DTEKPKA
-screens\2\name=MAC
+screens\1\name=MAC
+screens\2\name=DESKTOP-DTEKPKA
 ```
 
 `deskflow-server.conf` 关键片段：
@@ -120,9 +120,9 @@ end
 
 section: links
 	DESKTOP-DTEKPKA:
-		right = MAC
+		left = MAC
 	MAC:
-		left = DESKTOP-DTEKPKA
+		right = DESKTOP-DTEKPKA
 end
 
 section: options
@@ -146,6 +146,32 @@ D:\KEEPPER\_deskflow\run-server.cmd
 type D:\KEEPPER\_deskflow\core-server.log | findstr /I "clipboard"
 rem 期望：NOTE: clipboard sharing is disabled
 ```
+
+### 改「鼠标从哪一侧进出」
+
+跨屏方向**完全由服务端的屏幕排布决定**，客户端不用改：
+
+- `Deskflow.conf`（本机实际生效的那份）：`screens\N\name` 的 N 就是栅格序号，
+  行优先 —— `N = 行 × numColumns + 列 + 1`。`numColumns=5` 时，
+  `screens\1` 是第 0 列、`screens\2` 是第 1 列。**谁的序号小谁在左**。
+- `deskflow-server.conf`（Barrier 风格）：直接写死 `section: links` 的
+  `left` / `right`，改这个更直观。
+
+**当前布局**是「Windows **左**边缘出 → Mac **右**边缘进」，即两者对调之后的样子：
+`screens\1\name=MAC` / `screens\2\name=DESKTOP-DTEKPKA`，links 侧写成
+`DESKTOP-DTEKPKA: left = MAC` 与 `MAC: right = DESKTOP-DTEKPKA`。
+想换回「Windows 右边缘出 → Mac 左边缘进」，把这两组值再换回来即可。
+
+改完同样**必须重启服务端**。核验不用盯着鼠标试——把指针推到屏幕边缘，
+服务端会打日志：
+
+```
+INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 1679,688
+INFO: leaving screen
+```
+
+`at x,y` 是**落点在对端屏幕上的坐标**：x≈1679（贴近该屏最右）就说明是「从右侧进入」，
+x≈0 则是「从左侧进入」——一句话就能确认方向对不对。
 
 ---
 
@@ -233,9 +259,9 @@ INFO: entering screen
 |---|---|
 | 服务端监听 | `0.0.0.0:24800` |
 | 协议 | Barrier |
-| 服务端屏幕名 | `DESKTOP-DTEKPKA`（左） |
-| 客户端屏幕名 | `MAC`（右） |
-| 布局 | Windows(左) — Mac(右) |
+| 服务端屏幕名 | `DESKTOP-DTEKPKA`（右） |
+| 客户端屏幕名 | `MAC`（左） |
+| 布局 | Mac(左) — Windows(右)：Windows 左边缘出 → Mac 右边缘进 |
 | 剪贴板共享 | **false**（两份 conf 都要） |
 | 启动器 | `run-server.cmd`（登录自启：`Deskflow Server.lnk` → `run-server-hidden.vbs`） |
 | 日志 | `core-server.log` |
