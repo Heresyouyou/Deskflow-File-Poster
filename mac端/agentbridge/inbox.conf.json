@@ -1,0 +1,4 @@
+{
+  "write_clipboard": true,
+  "_note": "true = 收到 Windows 发来的文件后，把落地文件列表写进 Mac 剪贴板（可直接 ⌘V 粘走）"
+}
