@@ -98,12 +98,15 @@ mac端/
    ```
 5. **验证**：
    ```bash
-   B=http://127.0.0.1:8899; T="X-Bridge-Token: <令牌>"
+   B=http://<Mac IP>:8899; T="X-Bridge-Token: <令牌>"
    curl -s "$B/api/health" -H "$T"   # 存活（含 max_bytes / quota）
    curl -s "$B/api/push"   -H "$T"   # 本端直达推送接收器探针
    ```
    第二条返回 `{"ok":true,"service":"agentbridge-push","port":8899}` 即正常。
    （对端的对应探针是 `http://<Windows IP>:8900/api/push`，返回 `service":"clipwatch-push"`。）
+
+   > 注意 `bridge_server.py` 的 `BIND` 绑定的是**本机局域网 IP**（如 `192.168.10.153`），
+   > 因此**用 `127.0.0.1` 请求会被拒绝**（curl 退出码 7）。探针请用上面的局域网 IP 访问。
 6. **日常使用**
    - 发文件（Mac→Windows）：把文件丢进 `~/Downloads/KEEPPER-Outbox/`；
    - 收文件（Windows→Mac）：落在 `~/Downloads/KEEPPER-Inbox/`（重名自动加 `(1)`）；

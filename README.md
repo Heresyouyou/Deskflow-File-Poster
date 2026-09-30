@@ -123,11 +123,11 @@ Deskflow-File-Poster/
    **确保两端的 `X-Bridge-Token` 一致**。
 3. **验证** —— 两端各跑一次探针：
    ```bash
-   # Mac 本机
-   curl -s http://127.0.0.1:8899/api/health -H "X-Bridge-Token: <令牌>"
-   curl -s http://127.0.0.1:8899/api/push   -H "X-Bridge-Token: <令牌>"
+   # Mac 本机（注意用局域网 IP：服务端 BIND 绑的是本机 IP，127.0.0.1 会被拒绝）
+   curl -s http://192.168.10.153:8899/api/health -H "X-Bridge-Token: <令牌>"
+   curl -s http://192.168.10.153:8899/api/push   -H "X-Bridge-Token: <令牌>"
    # Windows 本机
-   curl -s http://127.0.0.1:8900/api/push   -H "X-Bridge-Token: <令牌>"
+   curl -s http://192.168.10.100:8900/api/push   -H "X-Bridge-Token: <令牌>"
    ```
    各返回 `{"ok":true,…}` 即接收器在线、防火墙放行。
 4. 具体命令、目录准备、启停方式，见对应端级 README。
