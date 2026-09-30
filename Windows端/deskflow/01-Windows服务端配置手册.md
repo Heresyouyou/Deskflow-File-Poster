@@ -151,17 +151,31 @@ rem 期望：NOTE: clipboard sharing is disabled
 
 ## 五、入站与端口
 
-服务端对外只需要 **24800/TCP 入站**（Deskflow 自身）。若 Windows 防火墙是默认策略
-（拒绝入站），需要放行：
+服务端对外只需要 **24800/TCP 入站**（Deskflow 自身）。本机实测该规则由 Deskflow
+安装时自带，名为 `Deskflow TCP 24800`，作用域是 `profile=Any / remoteaddress=Any`，
+**已经放行，无需手工再加**。核验：
+
+```powershell
+# 需管理员：读防火墙规则也要提权，否则报 Access is denied（System Error 5）
+Get-NetFirewallRule -DisplayName 'Deskflow TCP 24800' |
+    Select-Object DisplayName,Enabled,Direction,Action,Profile
+```
+
+只有在确实缺失时才手工补，并用 `-Profile Any` 而不是 `Private`：
 
 ```powershell
 # 需管理员
 New-NetFirewallRule -DisplayName 'Deskflow Server 24800' -Direction Inbound -Action Allow `
-  -Protocol TCP -LocalPort 24800 -RemoteAddress LocalSubnet -Profile Private
+  -Protocol TCP -LocalPort 24800 -RemoteAddress LocalSubnet -Profile Any
 ```
 
+> 为什么不用 `Private`：Windows 会重建网络配置（本机实测已到「网络 6」），
+> 新位置默认判为**公用**，`Private` 规则会**静默失配** —— 表现为 Mac 连不上、
+> 但日志里没有任何「被拒绝」的痕迹。`-RemoteAddress LocalSubnet` 已经把范围
+> 限死在同网段，比网络位置分类更可靠。
+
 > 另有 AgentBridge 直推用的 **8900/TCP**，与 Deskflow 无关，
-> 见 `../agentbridge/add_firewall_rule.ps1`。
+> 见 `../agentbridge/add_firewall_rule.ps1`（同样是 `-Profile Any` + `LocalSubnet`）。
 
 Deskflow 1.26 默认开 TLS。服务端证书与信任库在 `settings\tls\`；
 首次连接客户端时会校验对端指纹，**Mac 连不上、日志停在 `waiting for hello` 后 Timed out**

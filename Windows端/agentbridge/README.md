@@ -15,7 +15,7 @@
 |---|---|---|
 | 对端（Mac）地址 | `192.168.10.153` | `HOST` |
 | 对端（Mac）端口 | `8899` | Mac 唯一 HTTP 服务端：队列 API + `/api/push` |
-| 本机（Windows）地址 | `192.168.10.100` | 局域网静态地址，Profile = Private |
+| 本机（Windows）地址 | `192.168.10.100` | 局域网静态地址（Manual）；网络配置文件名「网络 6」，类别 = 专用 |
 | 本机监听端口 | `8900` | `PUSH_PORT`，**只用来接收**对端直推 |
 | 出站直推端口 | `8899` | `PEER_PUSH_PORT = PORT` —— 对端把 `/api/push` 挂在现有的 8899 上，没另起 8900 |
 | 鉴权头 | `X-Bridge-Token: CHANGE_ME_BRIDGE_TOKEN` | 两端必须一致；克隆后自行改回 |
@@ -176,9 +176,43 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\verify_firewall_rule.ps1
 
 ```
 display=KEEPPER Clipwatch Push 8900
-enabled=True direction=Inbound action=Allow profile=Private
+enabled=True direction=Inbound action=Allow profile=Any
 protocol=TCP localport=8900 remoteaddress=LocalSubnet interfacetype=Any
 ```
+
+`profile=Any` 是**有意为之**，不要收回成 `Private`：本机网络配置文件名已被 Windows
+重建过多次（实测当前是「网络 6」），新建网络默认判为**公用**，一旦如此，
+Private-only 的规则会**静默失配**，现象与「对端不再推送」完全一样，
+排查成本极高。放宽到 Any 后仍受两重约束：`remoteaddress=LocalSubnet`
+（只有同网段可达）与接收器的 `X-Bridge-Token`。
+
+### 开机后仍要保留的项（固化清单）
+
+| 项 | 载体 | 是否随重启保留 |
+|---|---|---|
+| clipwatch 自启 | 启动文件夹 `Clipwatch.lnk` → `run-clipwatch-hidden.vbs` | ✅ 登录即起 |
+| Deskflow 服务端自启 | 启动文件夹 `Deskflow Server.lnk` → `run-server-hidden.vbs` | ✅ 登录即起 |
+| 入站放行 8900 | 防火墙规则（持久存储） | ✅ |
+| 入站放行 24800 | Deskflow 自带规则 `Deskflow TCP 24800` | ✅ |
+| 本机静态地址 | `192.168.10.100/24`（Manual） | ✅ |
+| 幂等与去重状态 | `state\clipwatch.json`（`push_seen` / `seen_msgs` / `outbox_done`） | ✅ |
+| 剪贴板共享开关 | `Deskflow.conf` 与 `deskflow-server.conf` 两处 `clipboardSharing=false` | ✅ |
+
+开机后的一键核验：
+
+```powershell
+rem 1) 两个常驻进程都在（应有 clipwatch.py 与 deskflow-core.exe）
+Get-CimInstance Win32_Process -Filter "Name like 'python%' or Name like 'deskflow%'" |
+    Select-Object ProcessId,Name,CommandLine
+rem 2) 两个端口都在听
+netstat -ano | findstr ":8900 :24800"
+rem 3) 接收器探针（换成本机地址）
+curl.exe -s "http://192.168.10.100:8900/api/push" -H "X-Bridge-Token: <令牌>"
+```
+
+> 防火墙规则**读取也需要管理员**（非管理员报 `Access is denied`，System Error 5），
+> 所以第 3 步的探针比读规则更实用：探针通 = 监听在 + 本机可达；
+> 对端可达性由对端直推的成功日志（`via=push`）体现。
 
 ---
 

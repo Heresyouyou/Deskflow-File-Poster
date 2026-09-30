@@ -1,7 +1,7 @@
 param(
     [int]$Port = 8900,
     [string]$RuleName = '',
-    [string]$Profile = 'Private'
+    [string]$Profile = 'Any'
 )
 # Adds the inbound rule that lets the peer device POST files / clipboard directly
 # to this machine's clipwatch push receiver (protocol v2 direct push).
@@ -15,6 +15,12 @@ param(
 # Windows blocks inbound by default (DefaultInboundAction = NotConfigured == Block),
 # so without this rule the peer's direct push is refused and it silently degrades
 # to the v1 queue.
+#
+# Profile defaults to Any on purpose. A Private-only rule stops matching the moment
+# Windows re-detects the network and tags the new profile as Public, which happens
+# silently and looks exactly like "the peer stopped pushing". The rule is still
+# fenced in by -RemoteAddress LocalSubnet, i.e. only the local LAN can reach the port,
+# and the receiver additionally requires X-Bridge-Token.
 
 $ErrorActionPreference = 'Stop'
 if (-not $RuleName) { $RuleName = "KEEPPER Clipwatch Push $Port" }

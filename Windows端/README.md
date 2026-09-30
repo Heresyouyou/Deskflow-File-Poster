@@ -88,17 +88,31 @@ Windows端/
    D:\KEEPPER\_filebridge\run-clipwatch.cmd
    ```
    停止：结束 `pythonw.exe` / `python.exe` 上的 `clipwatch.py` 进程后按上面命令重启。
-5. **验证**：
+   `clipwatch.py` 自带命名互斥体，重复启动的第二个实例会自行退出。
+5. **开机自启（固化）**：在**启动文件夹**放两个快捷方式即可，登录后自动拉起，
+   无需管理员、不需要计划任务：
+
+   ```
+   %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\
+   ├── Clipwatch.lnk          -> wscript.exe "D:\KEEPPER\_filebridge\run-clipwatch-hidden.vbs"
+   └── Deskflow Server.lnk    -> wscript.exe "D:\KEEPPER\_deskflow\run-server-hidden.vbs"
+   ```
+
+   快捷方式属性里**起始位置**分别设成 `D:\KEEPPER\_filebridge` 与 `D:\KEEPPER\_deskflow`。
+   核验：`Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"`。
+   完整的「开机后仍要保留的项」清单见
+   [`agentbridge/README.md`](agentbridge/README.md#开机后仍要保留的项固化清单)。
+6. **验证**：
    ```powershell
    curl.exe -s "http://192.168.10.153:8899/api/health" -H "X-Bridge-Token: <令牌>"
    curl.exe -s "http://127.0.0.1:8900/api/push"     -H "X-Bridge-Token: <令牌>"
    ```
    第二条是**本端直达推送接收器**的探针，返回 `{"ok":true,"service":"clipwatch-push",...}` 即正常。
-6. **回归自检**（改完接收器代码后跑一遍）：
+7. **回归自检**（改完接收器代码后跑一遍）：
    ```cmd
    python selftest_push.py
    ```
-7. **日常使用**
+8. **日常使用**
    - 发文件（Windows→Mac）：把文件丢进投递箱 `D:\KEEPPER\_filebridge\outbox\`；
    - 收文件（Mac→Windows）：落在收件箱 `D:\KEEPPER\_filebridge\inbox\`（重名自动加 `(1)`）；
    - 剪贴板：复制文本 / 图片 / 文件即自动互传；
@@ -112,7 +126,9 @@ Windows端/
   已统一替换为占位符 **`CHANGE_ME_BRIDGE_TOKEN`**（涉及 `clipwatch.py`、
   `agentbridge/README.md`）。**克隆后必须自行改掉**，且不要把真实令牌提交回来。
 - 通道设计上**仅限局域网 `192.168.10.0/24`**，不应暴露到公网；防火墙放行规则
-  已限定 `RemoteAddress=LocalSubnet` + `Profile=Private`，如需变动请同时收紧。
+  已限定 `RemoteAddress=LocalSubnet`（只有同网段可达），网络位置写的是 `Profile=Any`
+  —— 这是有意为之，避免 Windows 重建网络配置后把新位置判为「公用」导致规则静默失配；
+  另有接收器的 `X-Bridge-Token` 作为第二道闸。如需变动请同时收紧。
 - 队列目录 `inbox/`、`outbox/`、`logs/`、`state/` 是**运行时产物**，
   其中可能含本机 IP、路径等信息，**请勿把运行时内容一并提交到公开仓库**。
 
