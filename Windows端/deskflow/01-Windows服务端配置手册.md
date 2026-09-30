@@ -15,10 +15,10 @@
 | **Server（服务端）** | Windows `192.168.10.100` | 物理键鼠插在这台机器上，由它广播输入 |
 | **Client（客户端）** | Mac `192.168.10.153` | 被动接收，光标划到边缘时接管 |
 | 服务端监听 | `0.0.0.0:24800` | Deskflow/Synergy 默认端口，TCP |
-| 服务端屏幕名 | `DESKTOP-DTEKPKA` | 布局里在**右** |
-| 客户端屏幕名 | `MAC` | **大小写敏感，必须完全一致** |
+| 服务端屏幕名 | `DESKTOP-DTEKPKA` | 布局里在**上** |
+| 客户端屏幕名 | `MAC` | 布局里在**下**；**大小写敏感，必须完全一致** |
 | 通信协议 | `Barrier` | 两端必须选同一种 |
-| 布局 | Mac 在左，Windows 在右 | Windows **左边缘**划出 → 进 Mac 的**右边缘**；Mac **右边缘**划出 → 回 Windows 的**左边缘** |
+| 布局 | Mac 在 Windows 的**正下方**（同列，左边缘对齐） | Windows **下边缘**划出 → 进 Mac 的**上边缘**；Mac **上边缘**划出 → 回 Windows 的**下边缘** |
 | 剪贴板共享 | **关闭** | 有意为之，交给 AgentBridge |
 
 **两端必须在同一二层网络（同网段）**，这是「同网段跨屏」方案的前提。
@@ -106,8 +106,12 @@ coreMode=0
 [internalConfig]
 clipboardSharing=false
 clipboardSharingSize=3072
-screens\1\name=MAC
-screens\2\name=DESKTOP-DTEKPKA
+screens\1\name=DESKTOP-DTEKPKA
+screens\2\name=
+screens\3\name=
+screens\4\name=
+screens\5\name=
+screens\6\name=MAC
 ```
 
 `deskflow-server.conf` 关键片段：
@@ -120,9 +124,9 @@ end
 
 section: links
 	DESKTOP-DTEKPKA:
-		left = MAC
+		down = MAC
 	MAC:
-		right = DESKTOP-DTEKPKA
+		up = DESKTOP-DTEKPKA
 end
 
 section: options
@@ -153,25 +157,31 @@ rem 期望：NOTE: clipboard sharing is disabled
 
 - `Deskflow.conf`（本机实际生效的那份）：`screens\N\name` 的 N 就是栅格序号，
   行优先 —— `N = 行 × numColumns + 列 + 1`。`numColumns=5` 时，
-  `screens\1` 是第 0 列、`screens\2` 是第 1 列。**谁的序号小谁在左**。
+  `screens\1` 是第 0 行第 0 列、`screens\6` 是第 1 行第 0 列。
+  **同一列 = 左右边缘对齐、上下相邻；同一行 = 上下边缘对齐、左右相邻。**
 - `deskflow-server.conf`（Barrier 风格）：直接写死 `section: links` 的
-  `left` / `right`，改这个更直观。
+  `left` / `right` / `up` / `down`，改这个更直观。
 
-**当前布局**是「Windows **左**边缘出 → Mac **右**边缘进」，即两者对调之后的样子：
-`screens\1\name=MAC` / `screens\2\name=DESKTOP-DTEKPKA`，links 侧写成
-`DESKTOP-DTEKPKA: left = MAC` 与 `MAC: right = DESKTOP-DTEKPKA`。
-想换回「Windows 右边缘出 → Mac 左边缘进」，把这两组值再换回来即可。
+**当前布局**是「Mac 在 Windows **正下方**、左边缘对齐」，即两者**同列上下相邻**：
+`screens\1\name=DESKTOP-DTEKPKA` / `screens\6\name=MAC`，links 侧写成
+`DESKTOP-DTEKPKA: down = MAC` 与 `MAC: up = DESKTOP-DTEKPKA`。
+于是 Windows **下边缘**划出 → 进 Mac 的**上边缘**；Mac **上边缘**划出 → 回 Windows 的**下边缘**。
+
+想改成左右并排，就占用**同一行**的两个相邻格子（如 `screens\1=MAC` /
+`screens\2=DESKTOP-DTEKPKA`，**谁序号小谁在左**），links 换成
+`left` / `right`；改成右下方同上，占用第 1 行的第 1 列（`screens\7`）即可。
 
 改完同样**必须重启服务端**。核验不用盯着鼠标试——把指针推到屏幕边缘，
 服务端会打日志：
 
 ```
-INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 1679,688
+INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 840,0
 INFO: leaving screen
 ```
 
-`at x,y` 是**落点在对端屏幕上的坐标**：x≈1679（贴近该屏最右）就说明是「从右侧进入」，
-x≈0 则是「从左侧进入」——一句话就能确认方向对不对。
+`at x,y` 是**落点在对端屏幕上的坐标**：y≈0（贴近该屏最上）就说明是「从上边缘进入」、
+y≈最大值则是「从下边缘进入」，x≈0 是「从左边缘进入」——
+一句话就能确认方向对不对。
 
 ---
 
@@ -219,16 +229,16 @@ Deskflow 1.26 默认开 TLS。服务端证书与信任库在 `settings\tls\`；
 | 2 | `type core-server.log \| findstr /I clipboard` | `NOTE: clipboard sharing is disabled` |
 | 3 | Mac 侧启动客户端 | 状态 **Connected** |
 | 4 | 看服务端日志 | `accepted secure socket` → `accepted client connection` → `saying hello as Barrier` |
-| 5 | 把 Windows 鼠标推到**最右边缘** | 光标出现在 Mac 上 |
+| 5 | 把 Windows 鼠标推到**下边缘** | 光标从 Mac 的**上边缘**进入 |
 | 6 | 在 Mac 上点、打字 | 正常响应 |
-| 7 | 把 Mac 光标推到**最左边缘** | 光标回到 Windows |
+| 7 | 把 Mac 光标推到**上边缘** | 光标从 Windows 的**下边缘**回到 Windows |
 
 服务端日志里跨屏切换长这样（正常现象，不是报错）：
 
 ```
-INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 0,434
+INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 840,0
 INFO: leaving screen
-INFO: switch from "MAC" to "DESKTOP-DTEKPKA" at 3321,942
+INFO: switch from "MAC" to "DESKTOP-DTEKPKA" at 1376,896
 INFO: entering screen
 ```
 
@@ -259,9 +269,9 @@ INFO: entering screen
 |---|---|
 | 服务端监听 | `0.0.0.0:24800` |
 | 协议 | Barrier |
-| 服务端屏幕名 | `DESKTOP-DTEKPKA`（右） |
-| 客户端屏幕名 | `MAC`（左） |
-| 布局 | Mac(左) — Windows(右)：Windows 左边缘出 → Mac 右边缘进 |
+| 服务端屏幕名 | `DESKTOP-DTEKPKA`（上） |
+| 客户端屏幕名 | `MAC`（下，同列左对齐） |
+| 布局 | Windows(上) / Mac(下)：Windows 下边缘出 → Mac 上边缘进 |
 | 剪贴板共享 | **false**（两份 conf 都要） |
 | 启动器 | `run-server.cmd`（登录自启：`Deskflow Server.lnk` → `run-server-hidden.vbs`） |
 | 日志 | `core-server.log` |
