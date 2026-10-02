@@ -40,6 +40,7 @@ import http.client
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import struct
@@ -82,6 +83,7 @@ MAX_BYTES = 256 * 1024 * 1024          # 单条上限，与冻结基线一致
 PLAN_BYTES_PER_SEC = 5 * 1024 * 1024   # 规划速率 5 MB/s（实测 43.4 MB/s 的 8.7 倍余量）
 TIMEOUT_BASE = 30.0                    # 单文件超时 = 30s + size / 5MB/s
 LIGHT_TIMEOUT = 8.0                    # 轻量请求（列举/ack/health）超时
+QUEUE_LIST_TIMEOUT = 2.5               # 队列列举单独设短超时：对端不可达时别把本地看门狗冻 8 s
 
 POLL_SEC = 2.0                         # 队列兜底轮询间隔（快路是反向推送，这里只处理离线积压）
 LOCAL_CLIP_SEC = 0.25                  # 本机剪贴板看门狗节奏：纯本地、无网络成本，从 2 s 收到 0.25 s
@@ -517,11 +519,18 @@ class Bridge(object):
     def __init__(self):
         self._conn = None
         self._push = None
+        self._qconn = None
 
     def _light_conn(self):
         if self._conn is None:
             self._conn = http.client.HTTPConnection(HOST, PORT, timeout=LIGHT_TIMEOUT)
         return self._conn
+
+    def _q_conn(self):
+        """队列列举专用连接：用短超时，避免对端不可达时阻塞本地看门狗。"""
+        if self._qconn is None:
+            self._qconn = http.client.HTTPConnection(HOST, PORT, timeout=QUEUE_LIST_TIMEOUT)
+        return self._qconn
 
     def _push_conn(self):
         if self._push is None:
@@ -544,6 +553,12 @@ class Bridge(object):
         except Exception:
             pass
         self._conn = None
+        try:
+            if self._qconn is not None:
+                self._qconn.close()
+        except Exception:
+            pass
+        self._qconn = None
         self._drop_push()
 
     def push(self, name, local_path=None, blob=None, size=None, orig_name=None, sha256=None):
@@ -612,9 +627,26 @@ class Bridge(object):
             raise
 
     def list_queue(self, queue):
-        st, resp, data = self._light('GET', '/api/%s' % queue)
-        if st != 200:
-            raise BridgeError('list %s -> HTTP %s' % (queue, st))
+        conn = self._q_conn()
+        try:
+            conn.request('GET', '/api/%s' % queue, headers=self._headers())
+            resp = conn.getresponse()
+            data = resp.read()
+            if resp.version < 11 or resp.will_close:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._qconn = None
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._qconn = None
+            raise
+        if resp.status != 200:
+            raise BridgeError('list %s -> HTTP %s' % (queue, resp.status))
         return json.loads(data.decode('utf-8')).get('messages', [])
 
     def health(self):
@@ -1140,6 +1172,39 @@ def send_clip_payload(bridge, payload, origin='clipboard'):
     log.info('[%s] 已发送剪贴板图片 %d B -> %s', origin, len(png), qname)
 
 
+# 出站剪贴板发送走独立线程：对端 /api/push 慢（实测一次小文本 6.7 s，日志里 12–17 s）时，
+# 0.25 s 的本地看门狗不能被它堵住 —— 否则这十几秒内的新复制全被压住，表现为"剪贴板很久不更新"。
+# 队列只留最新一条：对端慢时丢旧发新，保证最终落地的是用户最新复制的内容。
+_SEND_Q = queue.Queue(maxsize=1)
+
+
+def enqueue_clip_payload(payload):
+    """把要发的内容交给发送线程；满则丢弃尚未发出的旧内容（最新优先）。"""
+    try:
+        _SEND_Q.put_nowait(payload)
+    except queue.Full:
+        try:
+            _SEND_Q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            _SEND_Q.put_nowait(payload)
+        except queue.Full:
+            pass
+
+
+def _sender_loop():
+    b = Bridge()                          # 独立 Bridge：不与主循环共享连接
+    while True:
+        payload = _SEND_Q.get()
+        if payload is None:
+            break
+        try:
+            send_clip_payload(b, payload, 'clipboard')
+        except Exception as e:
+            log.error('异步发送剪贴板失败: %r', e)
+
+
 def check_clipboard(bridge, st):
     """剪贴板序号变了就读一次内容：文件/图片/文字三类取其一，全自动双向同步。"""
     seq = clip_seq()
@@ -1174,8 +1239,8 @@ def check_clipboard(bridge, st):
         what = '图片'
     else:
         what = '文本'
-    log.info('剪贴板检测到 %s', what)
-    send_clip_payload(bridge, payload, 'clipboard')
+    log.info('剪贴板检测到 %s（交给发送线程）', what)
+    enqueue_clip_payload(payload)
 
 
 def scan_outbox(bridge, st):
@@ -1475,6 +1540,7 @@ def run_forever():
     with _PUSH_LOCK:
         _PUSH_SEEN.update(st.get('push_seen', []))
     bridge = Bridge()
+    threading.Thread(target=_sender_loop, daemon=True).start()   # 出站发送与看门狗解耦
     srv = start_push_server()
     log.info('clipwatch 启动：base=%s 本地剪贴板=%ss 队列兜底=%ss 快路=%s',
              BASE, LOCAL_CLIP_SEC, POLL_SEC,

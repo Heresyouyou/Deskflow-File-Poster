@@ -18,7 +18,7 @@
 | 服务端屏幕名 | `DESKTOP-DTEKPKA` | 布局里在**上** |
 | 客户端屏幕名 | `MAC` | 布局里在**下**；**大小写敏感，必须完全一致** |
 | 通信协议 | `Barrier` | 两端必须选同一种 |
-| 布局 | Mac 在 Windows 的**正下方**（同列，左边缘对齐） | Windows **下边缘**划出 → 进 Mac 的**上边缘**；Mac **上边缘**划出 → 回 Windows 的**下边缘** |
+| 布局 | Mac 挂在 Windows 的**正下方左侧**，宽度只占 **2/5**（左边缘对齐） | 只有 Windows 下边缘的**左侧 40%** 划出才进 Mac 的**上边缘**；Mac **上边缘**划出任一点 → 回 Windows 下边缘左侧 40% |
 | 剪贴板共享 | **关闭** | 有意为之，交给 AgentBridge |
 
 **两端必须在同一二层网络（同网段）**，这是「同网段跨屏」方案的前提。
@@ -90,8 +90,16 @@ type D:\KEEPPER\_deskflow\core-server.log     rem 期望含 "clipboard sharing i
 
 | 文件 | 格式 | 本方案中的角色 |
 |---|---|---|
-| `Deskflow.conf` | GUI 存储：`[core]` / `[internalConfig]` | **启动器实际用 `-s` 指定的就是它** |
-| `deskflow-server.conf` | Barrier 风格：`section: screens` / `links` / `options` | 服务器布局与选项的规范形态 |
+| `Deskflow.conf` | GUI 存储：`[core]` / `[internalConfig]` | **启动器用 `-s` 指定的就是它**；它再用 `externalConfig` 把布局转交给下一份 |
+| `deskflow-server.conf` | Barrier 风格：`section: screens` / `links` / `options` | **当前实际生效的布局与选项来源**（能写"部分边缘"，GUI 格式不能） |
+
+> **为什么要转交**：GUI 格式（`[internalConfig]` + `numColumns/screens\N`）只能表达
+> "整条边相连"，而本方案要求「Mac 只占 Windows 宽度 2/5」，需要**部分边缘**的区间语法 ——
+> 那只有 Barrier 风格配置写得出。所以在 `Deskflow.conf` 里设
+> `externalConfig=true` + `externalConfigFile=<…>/settings/deskflow-server.conf`，
+> 由后者提供 `section: links`。
+> GUI 格式里那份网格（`screens\1` / `screens\6`）此时**不再生效**，留着只是为了
+> 万一哪天用 GUI 打开；**改布局要改的是 `deskflow-server.conf`**。
 
 > **不要只改一份。** 两边都设 `clipboardSharing=false`，否则一旦启动器指向的文件变了，
 > 行为会跟着变，而且现象是"剪贴板又被回灌了"，很难联想到配置。
@@ -106,6 +114,8 @@ coreMode=0
 [internalConfig]
 clipboardSharing=false
 clipboardSharingSize=3072
+externalConfig=true
+externalConfigFile=<本机路径>/settings/deskflow-server.conf
 screens\1\name=DESKTOP-DTEKPKA
 screens\2\name=
 screens\3\name=
@@ -124,9 +134,9 @@ end
 
 section: links
 	DESKTOP-DTEKPKA:
-		down = MAC
+		down(0,40) = MAC(0,100)
 	MAC:
-		up = DESKTOP-DTEKPKA
+		up(0,100) = DESKTOP-DTEKPKA(0,40)
 end
 
 section: options
@@ -151,37 +161,49 @@ type D:\KEEPPER\_deskflow\core-server.log | findstr /I "clipboard"
 rem 期望：NOTE: clipboard sharing is disabled
 ```
 
-### 改「鼠标从哪一侧进出」
+### 改「鼠标从哪一侧进出」与「占多宽」
 
-跨屏方向**完全由服务端的屏幕排布决定**，客户端不用改：
+跨屏方向与**连接宽度**由服务端的**生效配置**决定，客户端不用改。
+本方案生效的是 `deskflow-server.conf`（见第四节），关键就是 `section: links`：
 
-- `Deskflow.conf`（本机实际生效的那份）：`screens\N\name` 的 N 就是栅格序号，
-  行优先 —— `N = 行 × numColumns + 列 + 1`。`numColumns=5` 时，
-  `screens\1` 是第 0 行第 0 列、`screens\6` 是第 1 行第 0 列。
-  **同一列 = 左右边缘对齐、上下相邻；同一行 = 上下边缘对齐、左右相邻。**
-- `deskflow-server.conf`（Barrier 风格）：直接写死 `section: links` 的
-  `left` / `right` / `up` / `down`，改这个更直观。
+- 方向：`left` / `right` / `up` / `down`。
+- **宽度**：方向后面可以跟一个**区间** `(起点%,终点%)`，表示只把这条边的
+  这一段连过去；`=` 右边同样带区间，表示对端用哪一段来接。
+  **两边区间写 0–100 就是整条边相连。**
 
-**当前布局**是「Mac 在 Windows **正下方**、左边缘对齐」，即两者**同列上下相邻**：
-`screens\1\name=DESKTOP-DTEKPKA` / `screens\6\name=MAC`，links 侧写成
-`DESKTOP-DTEKPKA: down = MAC` 与 `MAC: up = DESKTOP-DTEKPKA`。
-于是 Windows **下边缘**划出 → 进 Mac 的**上边缘**；Mac **上边缘**划出 → 回 Windows 的**下边缘**。
+**当前布局**是「Mac 挂在 Windows 正下方左侧、只占宽度 2/5」，写法就是：
 
-想改成左右并排，就占用**同一行**的两个相邻格子（如 `screens\1=MAC` /
-`screens\2=DESKTOP-DTEKPKA`，**谁序号小谁在左**），links 换成
-`left` / `right`；改成右下方同上，占用第 1 行的第 1 列（`screens\7`）即可。
+```ini
+section: links
+	DESKTOP-DTEKPKA:
+		down(0,40) = MAC(0,100)      # Windows 下边缘 左 40% → Mac 整个上边缘
+	MAC:
+		up(0,100) = DESKTOP-DTEKPKA(0,40)
+end
+```
 
-改完同样**必须重启服务端**。核验不用盯着鼠标试——把指针推到屏幕边缘，
+`0,40` 即左侧 2/5。于是只有从 Windows 下边缘的**左 40%** 划出才会进 Mac，
+Mac 上边缘任意点划出则回到 Windows 下边缘的左 40% —— 效果上 Mac 就"挂"在
+Windows 的左下角、宽度只占 2/5。
+
+想调整宽度就改这两个 `40`（例如整条边相连写成 `down(0,100) = MAC(0,100)`）；
+想换方向就把 `down`/`up` 换成 `left`/`right` 并相应调整区间。
+
+> 为什么不用 GUI 格式的 `screens\N\name`：它只能表达"整条边相连"，
+> 写不出部分边缘，所以必须走 `externalConfig`（见第四节）。
+
+改完**必须重启服务端**。核验不用盯着鼠标试——把指针推到屏幕边缘，
 服务端会打日志：
 
 ```
-INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 840,0
+INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 1261,0
 INFO: leaving screen
 ```
 
-`at x,y` 是**落点在对端屏幕上的坐标**：y≈0（贴近该屏最上）就说明是「从上边缘进入」、
-y≈最大值则是「从下边缘进入」，x≈0 是「从左边缘进入」——
-一句话就能确认方向对不对。
+`at x,y` 是**落点在对端屏幕上的坐标**：y≈0 说明「从上边缘进入」，
+x≈0 是「从左边缘进入」。配合**负向验证**更可靠：
+在 Windows 下边缘的 **70%** 处划出应当**没有**任何日志（因为超出 0–40% 区间），
+在 **30%** 处划出则会打出上面这行 —— 一次就能确认区间宽度对不对。
 
 ---
 
@@ -229,14 +251,15 @@ Deskflow 1.26 默认开 TLS。服务端证书与信任库在 `settings\tls\`；
 | 2 | `type core-server.log \| findstr /I clipboard` | `NOTE: clipboard sharing is disabled` |
 | 3 | Mac 侧启动客户端 | 状态 **Connected** |
 | 4 | 看服务端日志 | `accepted secure socket` → `accepted client connection` → `saying hello as Barrier` |
-| 5 | 把 Windows 鼠标推到**下边缘** | 光标从 Mac 的**上边缘**进入 |
+| 5 | 把 Windows 鼠标推到**下边缘左侧 40% 内** | 光标从 Mac 的**上边缘**进入 |
 | 6 | 在 Mac 上点、打字 | 正常响应 |
-| 7 | 把 Mac 光标推到**上边缘** | 光标从 Windows 的**下边缘**回到 Windows |
+| 7 | 把 Mac 光标推到**上边缘** | 光标回到 Windows 下边缘左侧 40% 内 |
+| 8 | 在 Windows 下边缘 **70% 处**（超出 40% 区间）划出 | **不切换**，日志无新增 |
 
 服务端日志里跨屏切换长这样（正常现象，不是报错）：
 
 ```
-INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 840,0
+INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 1261,0
 INFO: leaving screen
 INFO: switch from "MAC" to "DESKTOP-DTEKPKA" at 1376,896
 INFO: entering screen
@@ -253,6 +276,7 @@ INFO: entering screen
 |---|---|---|
 | 服务端"莫名重启"/日志被清空 | 启动了第二个实例，抢 24800 | 保留 `run-server.cmd` 的幂等守卫 |
 | 改了 conf 不起作用 | 改的是另一份 conf，或没重启 | 两份都改 + 重启服务端 |
+| 布局退回"整条边相连"、区间失效 | 改的是 `Deskflow.conf` 里的网格；或 GUI 打开过把 `externalConfig` 关掉了 | 布局以 `deskflow-server.conf` 为准，并确认 `Deskflow.conf` 里 `externalConfig=true` |
 | 剪贴板又被回灌、写进去的文件 1–4 s 消失 | 某一份 conf 里 `clipboardSharing` 还是 true | 见第四节 |
 | `run-server.cmd` 报语法错 | 里面写了中文注释（cmd 按 ANSI 解码） | 注释只用 ASCII |
 | Mac 报 `waiting for hello` 后 Timed out | 服务端要求客户端证书，指纹不在白名单 | 见 `02-` 手册 |
@@ -270,8 +294,9 @@ INFO: entering screen
 | 服务端监听 | `0.0.0.0:24800` |
 | 协议 | Barrier |
 | 服务端屏幕名 | `DESKTOP-DTEKPKA`（上） |
-| 客户端屏幕名 | `MAC`（下，同列左对齐） |
-| 布局 | Windows(上) / Mac(下)：Windows 下边缘出 → Mac 上边缘进 |
+| 客户端屏幕名 | `MAC`（下） |
+| 布局 | Mac 挂在 Windows **正下方左侧**，宽度占 **2/5**：`down(0,40) = MAC(0,100)` |
+| 生效配置 | `deskflow-server.conf`（由 `Deskflow.conf` 的 `externalConfig=true` 转交） |
 | 剪贴板共享 | **false**（两份 conf 都要） |
 | 启动器 | `run-server.cmd`（登录自启：`Deskflow Server.lnk` → `run-server-hidden.vbs`） |
 | 日志 | `core-server.log` |

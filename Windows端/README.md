@@ -56,11 +56,14 @@ Windows端/
    - `coreMode=0`（**服务端模式**，Windows 是这套 KVM 的服务端）；
    - `clipboardSharing=false` —— 有意关闭，剪贴板交给 AgentBridge；
    - `screens\N\name` 里列出对端 Mac 的屏幕名（Mac 侧须为**大写 `MAC`**）。
-     **同一列 = 上下相邻（左边缘对齐），同一行 = 左右相邻**：本方案当前是
-     `screens\1\name=DESKTOP-DTEKPKA` / `screens\6\name=MAC`（`numColumns=5`，行优先），
-     即 **Mac 在 Windows 的正下方** —— Windows **下边缘**划出 → 从 Mac 的**上边缘**进入。
-     跨屏方向由服务端排布决定，客户端不用改；改法见
-     `Windows端/deskflow/01-Windows服务端配置手册.md#改鼠标从哪一侧进出`。
+   - **布局的实际来源是 `deskflow-server.conf`**：`Deskflow.conf` 里设了
+     `externalConfig=true` + `externalConfigFile=…/settings/deskflow-server.conf`，
+     由后者的 `section: links` 提供排布。本方案当前是 **Mac 挂在 Windows 正下方左侧、
+     宽度只占 2/5**（`down(0,40) = MAC(0,100)`）—— 只有 Windows **下边缘的左侧 40%**
+     划出才从 Mac 的**上边缘**进入。之所以不用 GUI 格式的网格，是因为它只能表达
+     "整条边相连"，写不出"只占 2/5"这种**部分边缘**。
+     跨屏方向与连接宽度由服务端决定，**客户端不用改**；改法见
+     `Windows端/deskflow/01-Windows服务端配置手册.md#改鼠标从哪一侧进出与占多宽`。
    - 另有一份 `deskflow-server.conf`（Barrier 风格）也带 `clipboardSharing`，
      **两份都要设为 `false`**，避免某个启动参数切换到另一份时又被打开。
 3. **信任 Mac 客户端**：若服务端开启了客户端证书校验，需把 Mac 客户端证书指纹加入
