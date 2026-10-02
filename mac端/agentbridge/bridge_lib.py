@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -29,7 +30,9 @@ JUNK_RE = re.compile(r"(^\.DS_Store$)|(^\._)|(^\.localized$)|(\.crdownload$)|(\.
 # 对端接收器不认（回 404），直推只会白吃一次往返，直接走本机队列。
 PUSH_PAYLOAD_RE = re.compile(
     r"^(cb_\d{8}-\d{6}-\d{3}_(mac|win)_(text|image)\.(txt|png)"
-    r"|file_\d{8}-\d{6}_.+|xfer_.+\.json)$")
+    r"|file_\d{8}-\d{6}_.+|xfer_.+\.json|drag_.+\.json)$")
+# 跨屏拖拽信令（协议 v1 阶段1）：drag_<id>_{begin,sync,drop,cancel}.json
+DRAG_RE = re.compile(r"^drag_([^_/]+)_(begin|sync|drop|cancel)\.json$")
 NAME_RE = re.compile(r"[^0-9A-Za-z._\-\u4e00-\u9fff]")
 
 TIMEOUT_BASE = 30.0      # 秒
@@ -61,6 +64,24 @@ def sha256_of(path):
 
 def is_push_payload(name):
     return bool(PUSH_PAYLOAD_RE.match(name))
+
+
+def new_drag_id(t=None):
+    """源端生成 drag_id：时间戳 + 4 位随机十六进制（同秒多次拖拽不撞）。"""
+    t = time.time() if t is None else t
+    return "%s-%04x" % (time.strftime("%Y%m%d-%H%M%S", time.localtime(t)), random.randint(0, 0xffff))
+
+
+def drag_signal_name(drag_id, kind):
+    return "drag_%s_%s.json" % (drag_id, kind)
+
+
+def push_drag_signal(drag_id, kind, obj, log=print):
+    """把 drag_<id>_<kind>.json 直推到对端 8900（不退回队列）。"""
+    name = drag_signal_name(drag_id, kind)
+    blob = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    res = push_bytes(name, blob, log=log)
+    return name, res
 
 
 def q(name):

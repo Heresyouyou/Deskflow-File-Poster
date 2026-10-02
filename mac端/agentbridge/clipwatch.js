@@ -14,7 +14,7 @@ ObjC.import('Foundation');
 
 var HOME = ObjC.unwrap($.NSHomeDirectory());
 var STATE = HOME + '/AgentBridge/.clip_self.json';
-var INTERVAL = 0.5;
+var INTERVAL = 0.25;   // 与 Windows 侧对齐：0.25 s 纯本机轮询，零网络成本
 
 var STDOUT = $.NSFileHandle.fileHandleWithStandardOutput;
 function emit(obj) {

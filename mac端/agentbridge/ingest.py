@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -22,7 +23,7 @@ import time
 sys.path.insert(0, os.path.expanduser("~/AgentBridge"))
 import bridge_lib as B  # noqa: E402
 
-INBOX = os.path.expanduser("~/Downloads/KEEPPER-Inbox")
+INBOX = os.path.expanduser("~/Downloads/KEEPPER-Files/inbox")
 LOG = os.path.join(B.ROOT, "inboxwatch.log")
 CONF = os.path.join(B.ROOT, "inbox.conf.json")
 CLIPWRITE = os.path.join(B.ROOT, "clipwrite.js")
@@ -43,6 +44,8 @@ FILE_MAX = 256 * 1024 * 1024
 
 DEDUPE = os.path.join(B.ROOT, ".push_dedupe.json")
 DEDUPE_CAP = 500
+DRAG_INBOX = os.path.join(B.ROOT, ".drag_inbox.jsonl")   # 入站 drag_* 信令 spool（供 dragwatch.py 对账）
+DRAG_INBOX_CAP = 2 * 1024 * 1024
 _lock = threading.Lock()
 
 
@@ -52,7 +55,8 @@ def is_payload(name):
     inboxwatch 的队列过滤与 /api/push 的受理判断共用本函数
     （对端 165013 的第 4 点建议：两处判断不能各写一份）。
     """
-    return bool(CB_RE.match(name) or XFR_RE.match(name) or name.startswith("file_"))
+    return bool(CB_RE.match(name) or XFR_RE.match(name)
+                or B.DRAG_RE.match(name) or name.startswith("file_"))
 
 
 def log(msg):
@@ -109,6 +113,22 @@ def dedupe_drop(name):
         _dedupe_save([n for n in _dedupe_load() if n != name])
 
 
+def drag_spool(name, obj):
+    """把入站 drag_* 信令追加到 spool（一行一条 JSON），dragwatch.py 增量读取对账。
+
+    单行一次 write()，读者按 \n 切整行，避免读到半行。
+    """
+    line = json.dumps({"name": name, "obj": obj, "ts": time.time()}, ensure_ascii=False)
+    with _lock:
+        try:
+            if os.path.getsize(DRAG_INBOX) > DRAG_INBOX_CAP:
+                os.replace(DRAG_INBOX, DRAG_INBOX + ".old")
+        except OSError:
+            pass
+        with open(DRAG_INBOX, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
 # ---------- 小工具 ----------
 
 def want_clipboard():
@@ -120,14 +140,15 @@ def want_clipboard():
 
 
 def unique_path(name):
-    """重名加序号，序号插在扩展名前：报告(1).pdf"""
+    """落地路径：本目录是临时中转（5 分钟 TTL 自动清），同名直接覆盖，
+    不再产生 报告(1).pdf 这类副本。"""
     os.makedirs(INBOX, exist_ok=True)
-    base, ext = os.path.splitext(name)
     p = os.path.join(INBOX, name)
-    i = 1
-    while os.path.exists(p):
-        p = os.path.join(INBOX, "%s(%d)%s" % (base, i, ext))
-        i += 1
+    if os.path.isfile(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
     return p
 
 
@@ -256,12 +277,65 @@ def verify_and_receipt(paths):
     send_clipack(result, paths)
 
 
-def clip_write_and_verify(landed):
-    """文件落地后的写剪贴板 + 后台核验回执（不阻塞调用方）。"""
-    if not landed or not want_clipboard():
+# ---------- 剪贴板后台写入（串行 worker，绝不阻塞 HTTP handler）----------
+# 背景：/api/push 曾在 handler 里同步跑 osascript 写 NSPasteboard，对端实测一次
+# 小文本要 6.73 s 才拿到 200；并发请求还会各自 spawn osascript 争抢剪贴板。
+# 现在 handler 只做「校验 + 去重登记 + 入队」立刻回 200，写剪贴板交单条后台线程
+# 串行处理（同时避免 NSPasteboard 争用）。
+_clip_q = queue.Queue()
+_clip_lock = threading.Lock()
+_clip_started = False
+
+
+def _clip_worker():
+    while True:
+        job = _clip_q.get()
+        try:
+            _run_clip_job(job)
+        except Exception as e:
+            log("剪贴板后台任务异常: %s" % e)
+        finally:
+            _clip_q.task_done()
+
+
+def _ensure_clip_worker():
+    global _clip_started
+    if _clip_started:
         return
-    if write_clipboard(landed):
-        threading.Thread(target=verify_and_receipt, args=(list(landed),), daemon=True).start()
+    with _clip_lock:
+        if not _clip_started:
+            threading.Thread(target=_clip_worker, daemon=True).start()
+            _clip_started = True
+
+
+def enqueue_clip(job):
+    _ensure_clip_worker()
+    _clip_q.put(job)
+
+
+def _run_clip_job(job):
+    """真正碰 NSPasteboard 只在这里发生；失败则撤销去重登记，允许对端重推。"""
+    kind = job[0]
+    if kind == "cb":
+        _, name, ckind, blob = job
+        if not want_clipboard():
+            log("%s 收到剪贴板 %s，但 write_clipboard=false" % (name, ckind))
+            return
+        res = apply_clip(ckind, blob)
+        if res:
+            log("落地 %s -> 本机剪贴板（%s %dB cc=%s）"
+                % (name, ckind, len(blob), res.get("cc")))
+            return
+        log("落地 %s 写剪贴板失败，撤销去重登记供对端重推" % name)
+        dedupe_drop(name)
+        notify("AgentBridge 剪贴板落地失败", name)
+        return
+    if kind == "files":
+        _, paths = job
+        if not want_clipboard():
+            return
+        if write_clipboard(paths):
+            threading.Thread(target=verify_and_receipt, args=(list(paths),), daemon=True).start()
 
 
 # ---------- 统一入口 ----------
@@ -297,13 +371,22 @@ def ingest_entry(name, blob, sha_declared=None, orig_b64=""):
         if not want_clipboard():
             log("%s 收到剪贴板 %s，但 write_clipboard=false" % (name, kind))
             return _err(422, "clipboard writing disabled")
-        res = apply_clip(kind, blob)
-        if not res:
-            return _err(422, "clipboard write failed")
         dedupe_add(name)
-        log("落地 %s -> 本机剪贴板（%s %dB cc=%s）"
-            % (name, kind, len(blob), res.get("cc")))
+        enqueue_clip(("cb", name, kind, bytes(blob)))
+        log("受理 %s（剪贴板 %s %dB），写入已交后台" % (name, kind, len(blob)))
         return {"code": 200, "action": "clipboard", "sha256": actual}
+
+    # ---- 跨屏拖拽信令：drag_<id>_{begin,sync,drop,cancel}.json ----
+    if B.DRAG_RE.match(name):
+        try:
+            obj = json.loads(blob.decode("utf-8", "replace"))
+        except Exception as e:
+            log("拖拽信令 %s 解析失败: %s" % (name, e))
+            return _err(400, "bad drag json")
+        dedupe_add(name)
+        drag_spool(name, obj)
+        log("受理拖拽信令 %s" % name)
+        return {"code": 200, "action": "drag", "sha256": actual}
 
     # ---- 清单：只记账 ----
     if XFR_RE.match(name):
@@ -333,7 +416,7 @@ def ingest_entry(name, blob, sha_declared=None, orig_b64=""):
         log("落地 %s -> %s (%dB sha=%s..)"
             % (name, os.path.basename(dst), len(blob), actual[:12]))
         notify("AgentBridge 收到文件", os.path.basename(dst))
-        clip_write_and_verify([dst])
+        enqueue_clip(("files", [dst]))
         return {"code": 200, "action": "inbox", "sha256": actual}
 
     # ---- 非载荷名 ----

@@ -37,6 +37,8 @@ MAX_BYTES = 256 * 1024 * 1024          # 单条上限 256 MB
 QUEUE_QUOTA = 4 * 1024 * 1024 * 1024   # 每队列 4 GB
 PART_TTL = 24 * 3600                   # .part 残留 TTL
 DONE_TTL = 7 * 24 * 3600               # _done 归档保留 7 天
+FILES_DIR = os.path.expanduser("~/Downloads/KEEPPER-Files")
+FILES_TTL = 5 * 60                     # 文件互传/拖拽暂存目录内文件 TTL（5 分钟自动清）
 CHUNK = 1024 * 1024
 LOGFILE = os.path.join(ROOT, "bridge.log")
 METADIR = os.path.join(ROOT, ".meta")
@@ -136,6 +138,22 @@ def cleaner():
                         os.remove(p)
                         log("clean _done/%s/%s (>%dd)" % (q, n, DONE_TTL // 86400))
         time.sleep(3600)
+
+
+def files_cleaner():
+    """文件互传目录（收/发/拖拽暂存）内所有文件满 5 分钟自动删。"""
+    while True:
+        now = time.time()
+        for root, _dirs, files in os.walk(FILES_DIR):
+            for n in files:
+                p = os.path.join(root, n)
+                try:
+                    if now - os.path.getmtime(p) > FILES_TTL:
+                        os.remove(p)
+                        log("clean files %s (>%ds)" % (p, FILES_TTL))
+                except OSError:
+                    pass
+        time.sleep(60)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -446,6 +464,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     threading.Thread(target=cleaner, daemon=True).start()
+    threading.Thread(target=files_cleaner, daemon=True).start()
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
     srv.daemon_threads = True
     log("bridge v2 up on http://%s:%d root=%s max=%dMB quota=%dGB" %

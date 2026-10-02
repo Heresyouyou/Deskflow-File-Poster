@@ -9,9 +9,11 @@
 import hashlib
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.expanduser("~/AgentBridge"))
@@ -46,11 +48,16 @@ def load_state():
         return {"sent_cc": []}
 
 
+_STATE_LOCK = threading.Lock()
+
+
 def save_state(st):
+    """读循环与发送线程都会写 state，加锁避免并发写坏 STATE。"""
     st["sent_cc"] = st.get("sent_cc", [])[-50:]
     try:
-        with open(STATE, "w", encoding="utf-8") as f:
-            json.dump(st, f)
+        with _STATE_LOCK:
+            with open(STATE, "w", encoding="utf-8") as f:
+                json.dump(st, f)
     except OSError:
         pass
 
@@ -118,8 +125,41 @@ def spawn():
                             text=True, bufsize=1)
 
 
+SEND_Q = queue.Queue()
+
+
+def sender_loop(st):
+    """所有出站网络 IO 都在这里做，与看门狗读循环解耦：
+    对端不可达时单条 push 最长 30s×3 重试，也不会冻住本地剪贴板检测。"""
+    while True:
+        job = SEND_Q.get()
+        kind = job[0]
+        try:
+            if kind == "clip":
+                _, ekind, path = job
+                try:
+                    send_clip_event(st, ekind, path)
+                finally:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            elif kind == "files":
+                _, paths = job
+                try:
+                    n = B.send_paths(paths, log=log)
+                    log("本批发送完成，%d 项" % n)
+                except Exception as e:
+                    log("发送失败: %s" % e)
+        except Exception as e:
+            log("发送线程异常: %s" % e)
+        finally:
+            SEND_Q.task_done()
+
+
 def main():
     st = load_state()
+    threading.Thread(target=sender_loop, args=(st,), daemon=True).start()
     proc = spawn()
     log("clipwatch 启动，JXA 守护 pid=%d" % proc.pid)
     while True:
@@ -157,14 +197,8 @@ def main():
                 continue
             st.setdefault("sent_cc", []).append(cc)
             save_state(st)
-            path = ev.get("path")
-            try:
-                send_clip_event(st, kind, path)
-            finally:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            # 网络 IO 交发送线程：读循环（本地看门狗）不被慢 push 冻住
+            SEND_Q.put(("clip", kind, ev.get("path")))
             continue
 
         if kind != "files":
@@ -183,11 +217,7 @@ def main():
 
         log("剪贴板出现 %d 项: %s"
             % (len(paths), ", ".join(os.path.basename(p.rstrip("/")) for p in paths)))
-        try:
-            n = B.send_paths(paths, log=log)
-            log("本批发送完成，%d 项" % n)
-        except Exception as e:
-            log("发送失败: %s" % e)
+        SEND_Q.put(("files", paths))
 
 
 if __name__ == "__main__":

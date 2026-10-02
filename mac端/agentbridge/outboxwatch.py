@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Outbox → Windows。
 
-监视 ~/Downloads/KEEPPER-Outbox/：丢进去的文件/目录，待大小与 mtime 连续两次采样不变
-（写稳）后发到 mac2win，随后移入 Outbox/.sent/ 留痕。
+监视 ~/Downloads/KEEPPER-Files/outbox/：丢进去的文件/目录，待大小与 mtime 连续两次采样不变
+（写稳）后发到 mac2win，随后移入 outbox/.sent/ 留痕。
 """
 import json
 import os
@@ -13,7 +13,7 @@ import time
 sys.path.insert(0, os.path.expanduser("~/AgentBridge"))
 import bridge_lib as B  # noqa: E402
 
-OUTBOX = os.path.expanduser("~/Downloads/KEEPPER-Outbox")
+OUTBOX = os.path.expanduser("~/Downloads/KEEPPER-Files/outbox")
 SENT = os.path.join(OUTBOX, ".sent")
 LOG = os.path.join(B.ROOT, "outboxwatch.log")
 INTERVAL = 2.0
