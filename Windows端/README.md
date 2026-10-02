@@ -59,9 +59,9 @@ Windows端/
    - **布局的实际来源是 `deskflow-server.conf`**：`Deskflow.conf` 里设了
      `externalConfig=true` + `externalConfigFile=…/settings/deskflow-server.conf`，
      由后者的 `section: links` 提供排布。本方案当前是 **Mac 挂在 Windows 正下方左侧、
-     宽度只占 2/5**（`down(0,40) = MAC(0,100)`）—— 只有 Windows **下边缘的左侧 40%**
+     宽度只占 37%**（`down(0,37) = MAC(0,100)`）—— 只有 Windows **下边缘的左侧 37%**
      划出才从 Mac 的**上边缘**进入。之所以不用 GUI 格式的网格，是因为它只能表达
-     "整条边相连"，写不出"只占 2/5"这种**部分边缘**。
+     "整条边相连"，写不出"只占 37%"这种**部分边缘**。
      跨屏方向与连接宽度由服务端决定，**客户端不用改**；改法见
      `Windows端/deskflow/01-Windows服务端配置手册.md#改鼠标从哪一侧进出与占多宽`。
    - 另有一份 `deskflow-server.conf`（Barrier 风格）也带 `clipboardSharing`，

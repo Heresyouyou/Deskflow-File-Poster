@@ -18,7 +18,7 @@
 | 服务端屏幕名 | `DESKTOP-DTEKPKA` | 布局里在**上** |
 | 客户端屏幕名 | `MAC` | 布局里在**下**；**大小写敏感，必须完全一致** |
 | 通信协议 | `Barrier` | 两端必须选同一种 |
-| 布局 | Mac 挂在 Windows 的**正下方左侧**，宽度只占 **2/5**（左边缘对齐） | 只有 Windows 下边缘的**左侧 40%** 划出才进 Mac 的**上边缘**；Mac **上边缘**划出任一点 → 回 Windows 下边缘左侧 40% |
+| 布局 | Mac 挂在 Windows 的**正下方左侧**，宽度只占 **37%**（左边缘对齐） | 只有 Windows 下边缘的**左侧 37%** 划出才进 Mac 的**上边缘**；Mac **上边缘**划出任一点 → 回 Windows 下边缘左侧 37% |
 | 剪贴板共享 | **关闭** | 有意为之，交给 AgentBridge |
 
 **两端必须在同一二层网络（同网段）**，这是「同网段跨屏」方案的前提。
@@ -94,7 +94,7 @@ type D:\KEEPPER\_deskflow\core-server.log     rem 期望含 "clipboard sharing i
 | `deskflow-server.conf` | Barrier 风格：`section: screens` / `links` / `options` | **当前实际生效的布局与选项来源**（能写"部分边缘"，GUI 格式不能） |
 
 > **为什么要转交**：GUI 格式（`[internalConfig]` + `numColumns/screens\N`）只能表达
-> "整条边相连"，而本方案要求「Mac 只占 Windows 宽度 2/5」，需要**部分边缘**的区间语法 ——
+> "整条边相连"，而本方案要求「Mac 只占 Windows 宽度 37%」，需要**部分边缘**的区间语法 ——
 > 那只有 Barrier 风格配置写得出。所以在 `Deskflow.conf` 里设
 > `externalConfig=true` + `externalConfigFile=<…>/settings/deskflow-server.conf`，
 > 由后者提供 `section: links`。
@@ -134,9 +134,9 @@ end
 
 section: links
 	DESKTOP-DTEKPKA:
-		down(0,40) = MAC(0,100)
+		down(0,37) = MAC(0,100)
 	MAC:
-		up(0,100) = DESKTOP-DTEKPKA(0,40)
+		up(0,100) = DESKTOP-DTEKPKA(0,37)
 end
 
 section: options
@@ -171,22 +171,22 @@ rem 期望：NOTE: clipboard sharing is disabled
   这一段连过去；`=` 右边同样带区间，表示对端用哪一段来接。
   **两边区间写 0–100 就是整条边相连。**
 
-**当前布局**是「Mac 挂在 Windows 正下方左侧、只占宽度 2/5」，写法就是：
+**当前布局**是「Mac 挂在 Windows 正下方左侧、只占宽度 37%」，写法就是：
 
 ```ini
 section: links
 	DESKTOP-DTEKPKA:
-		down(0,40) = MAC(0,100)      # Windows 下边缘 左 40% → Mac 整个上边缘
+		down(0,37) = MAC(0,100)      # Windows 下边缘 左 37% → Mac 整个上边缘
 	MAC:
-		up(0,100) = DESKTOP-DTEKPKA(0,40)
+		up(0,100) = DESKTOP-DTEKPKA(0,37)
 end
 ```
 
-`0,40` 即左侧 2/5。于是只有从 Windows 下边缘的**左 40%** 划出才会进 Mac，
-Mac 上边缘任意点划出则回到 Windows 下边缘的左 40% —— 效果上 Mac 就"挂"在
-Windows 的左下角、宽度只占 2/5。
+`0,37` 即左侧 37%。于是只有从 Windows 下边缘的**左 37%** 划出才会进 Mac，
+Mac 上边缘任意点划出则回到 Windows 下边缘的左 37% —— 效果上 Mac 就"挂"在
+Windows 的左下角、宽度只占 37%。
 
-想调整宽度就改这两个 `40`（例如整条边相连写成 `down(0,100) = MAC(0,100)`）；
+想调整宽度就改这两个 `37`（例如整条边相连写成 `down(0,100) = MAC(0,100)`）；
 想换方向就把 `down`/`up` 换成 `left`/`right` 并相应调整区间。
 
 > 为什么不用 GUI 格式的 `screens\N\name`：它只能表达"整条边相连"，
@@ -196,13 +196,13 @@ Windows 的左下角、宽度只占 2/5。
 服务端会打日志：
 
 ```
-INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 1261,0
+INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 1364,0
 INFO: leaving screen
 ```
 
 `at x,y` 是**落点在对端屏幕上的坐标**：y≈0 说明「从上边缘进入」，
 x≈0 是「从左边缘进入」。配合**负向验证**更可靠：
-在 Windows 下边缘的 **70%** 处划出应当**没有**任何日志（因为超出 0–40% 区间），
+在 Windows 下边缘的 **70%** 处划出应当**没有**任何日志（因为超出 0–37% 区间），
 在 **30%** 处划出则会打出上面这行 —— 一次就能确认区间宽度对不对。
 
 ---
@@ -251,15 +251,15 @@ Deskflow 1.26 默认开 TLS。服务端证书与信任库在 `settings\tls\`；
 | 2 | `type core-server.log \| findstr /I clipboard` | `NOTE: clipboard sharing is disabled` |
 | 3 | Mac 侧启动客户端 | 状态 **Connected** |
 | 4 | 看服务端日志 | `accepted secure socket` → `accepted client connection` → `saying hello as Barrier` |
-| 5 | 把 Windows 鼠标推到**下边缘左侧 40% 内** | 光标从 Mac 的**上边缘**进入 |
+| 5 | 把 Windows 鼠标推到**下边缘左侧 37% 内** | 光标从 Mac 的**上边缘**进入 |
 | 6 | 在 Mac 上点、打字 | 正常响应 |
-| 7 | 把 Mac 光标推到**上边缘** | 光标回到 Windows 下边缘左侧 40% 内 |
-| 8 | 在 Windows 下边缘 **70% 处**（超出 40% 区间）划出 | **不切换**，日志无新增 |
+| 7 | 把 Mac 光标推到**上边缘** | 光标回到 Windows 下边缘左侧 37% 内 |
+| 8 | 在 Windows 下边缘 **70% 处**（超出 37% 区间）划出 | **不切换**，日志无新增 |
 
 服务端日志里跨屏切换长这样（正常现象，不是报错）：
 
 ```
-INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 1261,0
+INFO: switch from "DESKTOP-DTEKPKA" to "MAC" at 1364,0
 INFO: leaving screen
 INFO: switch from "MAC" to "DESKTOP-DTEKPKA" at 1376,896
 INFO: entering screen
@@ -295,7 +295,7 @@ INFO: entering screen
 | 协议 | Barrier |
 | 服务端屏幕名 | `DESKTOP-DTEKPKA`（上） |
 | 客户端屏幕名 | `MAC`（下） |
-| 布局 | Mac 挂在 Windows **正下方左侧**，宽度占 **2/5**：`down(0,40) = MAC(0,100)` |
+| 布局 | Mac 挂在 Windows **正下方左侧**，宽度占 **37%**：`down(0,37) = MAC(0,100)` |
 | 生效配置 | `deskflow-server.conf`（由 `Deskflow.conf` 的 `externalConfig=true` 转交） |
 | 剪贴板共享 | **false**（两份 conf 都要） |
 | 启动器 | `run-server.cmd`（登录自启：`Deskflow Server.lnk` → `run-server-hidden.vbs`） |
