@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Deskflow 连接触启：登录自启的轻量守护，检测到客户端连上后拉起 clipwatch。
+"""KEEPPER 看门狗：登录自启的常驻守护，保证 Windows 侧服务与 Trae 无关地一直在线。
 
-为什么需要它：剪贴板/文件双向传输（clipwatch）只在两端真的连上时才有意义，
-故不再登录即常驻，而是由本守护盯 Deskflow 服务端日志 —— 一旦出现
-`client "MAC" has connected`，就拉起 clipwatch；连接断开期间不做事。
+它做两件事，每 POLL 秒一轮：
+  1) 保活 Deskflow 服务端（deskflow-core.exe）——进程不在就拉起 run-server-hidden.vbs。
+     服务端一挂 Mac 就连不上，故必须自愈，不能依赖任何 IDE/终端会话。
+  2) 客户端连上后拉起 clipwatch（剪贴板/文件双向传输）——同样自愈。
 
-判据与 clipwatch 一致，读同一个 `core-server.log` 尾部：最后一条
-`has connected` / `has disconnected` 决定当前是否已连接。拉起用同一套
-`run-clipwatch-hidden.vbs`（clipwatch 内建命名互斥体，重复拉起会自退，天然幂等）。
-
-本脚本自身也用命名互斥体保证单例。日志见 logs/autostart.log。
+为什么不靠 Trae：本脚本由「计划任务」在登录时以 wscript 启动，父进程是系统，
+与 Trae 的作业对象无关；Trae 关掉不会带走它。脚本自身用命名互斥体保证单例。
+日志见 logs/autostart.log。
 """
 
 import ctypes
@@ -22,13 +21,15 @@ import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DESKFLOW_LOG = r'D:\KEEPPER\_deskflow\core-server.log'
+LAUNCH_SERVER_VBS = r'D:\KEEPPER\_deskflow\run-server-hidden.vbs'   # 拉起 Deskflow 服务端
+LAUNCH_CLIP_VBS = os.path.join(BASE, 'run-clipwatch-hidden.vbs')    # 拉起 clipwatch
 LOG_FILE = os.path.join(BASE, 'logs', 'autostart.log')
-LAUNCHER_VBS = os.path.join(BASE, 'run-clipwatch-hidden.vbs')   # 拉起 clipwatch（隐藏窗口）
 
 CLIP_MUTEX = 'KEEPPER_clipwatch_mutex'      # 与 clipwatch.py 内建互斥体同名
 SELF_MUTEX = 'KEEPPER_autostart_mutex'
-POLL_SEC = 3.0
-LAUNCH_COOLDOWN = 10.0                      # 拉起冷却，避免启动窗口内反复拉起
+SERVER_IMAGE = 'deskflow-core.exe'
+POLL_SEC = 5.0
+RELAUNCH_COOLDOWN = 15.0                    # 同一目标两次拉起的最小间隔，避免启动窗口内反复拉起
 ERROR_ALREADY_EXISTS = 183
 
 RE_MARK = re.compile(r'client "[^"]*" has (connected|disconnected)')
@@ -62,6 +63,17 @@ def clipwatch_running():
     return _mutex_exists(CLIP_MUTEX)
 
 
+def server_running():
+    """deskflow-core.exe 是否在跑（tasklist 查询，轻量）。"""
+    try:
+        out = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq %s' % SERVER_IMAGE, '/NH'],
+                             capture_output=True, text=True,
+                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        return SERVER_IMAGE.lower() in (out.stdout or '').lower()
+    except OSError:
+        return False
+
+
 def client_connected():
     """Deskflow 当前是否有客户端连上：读日志尾部，最后一条 connect/disconnect 决定。"""
     try:
@@ -79,31 +91,35 @@ def client_connected():
     return state
 
 
-def launch_clipwatch():
-    subprocess.Popen(['wscript.exe', LAUNCHER_VBS],
+def _run_hidden(vbs):
+    subprocess.Popen(['wscript.exe', vbs],
                      creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
 
 def run_forever():
     setup_logging()
     if _mutex_exists(SELF_MUTEX):
-        log.info('已有 autostart 实例在运行，本进程退出')
+        log.info('已有看门狗实例在运行，本进程退出')
         return 0
-    # 本实例持有自互斥体（创建新句柄后不关闭，进程存活期间一直持有）
-    _k32.CreateMutexW(None, True, SELF_MUTEX)
-    log.info('deskflow-autostart 启动：轮询 %s（%.1fs），连上即拉起 clipwatch',
-             DESKFLOW_LOG, POLL_SEC)
-    last_launch = 0.0
+    _k32.CreateMutexW(None, True, SELF_MUTEX)   # 本实例持有自互斥体（句柄不关，进程存活期间一直持有）
+    log.info('KEEPPER 看门狗启动：%s 保活 + 客户端连上即拉起 clipwatch（%.0fs 一轮）',
+             SERVER_IMAGE, POLL_SEC)
+    last = {}
     while True:
         try:
-            if client_connected() and not clipwatch_running():
-                now = time.time()
-                if now - last_launch >= LAUNCH_COOLDOWN:
-                    last_launch = now
-                    launch_clipwatch()
+            now = time.time()
+            if not server_running():
+                if now - last.get('server', 0) >= RELAUNCH_COOLDOWN:
+                    last['server'] = now
+                    _run_hidden(LAUNCH_SERVER_VBS)
+                    log.warning('Deskflow 服务端未在运行，已拉起')
+            elif client_connected() and not clipwatch_running():
+                if now - last.get('clip', 0) >= RELAUNCH_COOLDOWN:
+                    last['clip'] = now
+                    _run_hidden(LAUNCH_CLIP_VBS)
                     log.info('Deskflow 客户端已连上，拉起 clipwatch')
         except Exception as e:
-            log.error('轮询异常: %r', e)
+            log.error('看门狗轮询异常: %r', e)
         time.sleep(POLL_SEC)
 
 
