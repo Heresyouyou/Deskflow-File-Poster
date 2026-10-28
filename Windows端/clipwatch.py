@@ -36,6 +36,8 @@ clipwatch.py —— Windows 侧文件互传常驻服务（复用 Mac 的 AgentBr
 """
 
 import base64
+import ctypes
+import ctypes.wintypes as wintypes
 import draghook
 import hashlib
 import http.client
@@ -148,6 +150,7 @@ def setup_logging(verbose_console=False):
 def load_state():
     default = {
         'last_seq': -1,        # 上次见到的剪贴板序号
+        'clip_ts': 0.0,        # 本机剪贴板最后一次变化的时刻（0 = 未知，按陈旧处理）
         'last_fp': '',         # 上次见到的剪贴板内容指纹（内容没变就不重发）
         'self_seq': -1,        # 我方自己写入剪贴板后的序号（防回环）
         'self_fp': '',         # 我方自己写入的内容指纹（与 self_seq 联合判定）
@@ -275,62 +278,191 @@ def orig_name_from_qname(qname):
 
 
 # ---------------------------------------------------------------- 剪贴板
+#
+# 【重要】本层刻意不用 pywin32 的 win32clipboard。
+# 实测 pywin32 312 的 EmptyClipboard 重复调用约 200 次后，线程会丢失剪贴板所有权
+# （SetClipboardData 报 1418 ERROR_CLIPBOARD_NOT_OPEN），更糟时损坏进程堆，进程被
+# 0xC0000374（STATUS_HEAP_CORRUPTION）直接杀掉 —— 没有 Python 异常、没有 stderr、
+# 没有日志，表现就是 clipwatch「启动 1~2 秒后静默消失」、看门狗每 15 秒重启一次。
+# 同压测下 ctypes 直调 1000 次零崩溃，故剪贴板读写全部改为 ctypes。
 
-def _open_clip():
-    """占住剪贴板（最多重试 5 次）。返回 True 时必须配 CloseClipboard()。"""
-    import win32clipboard
-    for _ in range(5):
-        try:
-            win32clipboard.OpenClipboard()
+_u32 = ctypes.WinDLL('user32', use_last_error=True)
+_k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+_s32 = ctypes.WinDLL('shell32', use_last_error=True)
+
+CF_DIB = 8
+CF_UNICODETEXT = 13
+CF_HDROP = 15
+GMEM_MOVEABLE = 0x0002
+CLIP_OPEN_TRIES = 8
+CLIP_SET_TRIES = 3
+
+_u32.OpenClipboard.argtypes = [wintypes.HWND]
+_u32.OpenClipboard.restype = wintypes.BOOL
+_u32.CloseClipboard.argtypes = []
+_u32.CloseClipboard.restype = wintypes.BOOL
+_u32.EmptyClipboard.argtypes = []
+_u32.EmptyClipboard.restype = wintypes.BOOL
+_u32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+_u32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+_u32.GetClipboardData.argtypes = [wintypes.UINT]
+_u32.GetClipboardData.restype = wintypes.HANDLE
+_u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+_u32.SetClipboardData.restype = wintypes.HANDLE
+_u32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+_u32.RegisterClipboardFormatW.restype = wintypes.UINT
+_u32.GetClipboardSequenceNumber.argtypes = []
+_u32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+
+_k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+_k32.GlobalAlloc.restype = wintypes.HANDLE
+_k32.GlobalLock.argtypes = [wintypes.HANDLE]
+_k32.GlobalLock.restype = ctypes.c_void_p
+_k32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+_k32.GlobalUnlock.restype = wintypes.BOOL
+_k32.GlobalSize.argtypes = [wintypes.HANDLE]
+_k32.GlobalSize.restype = ctypes.c_size_t
+_k32.GlobalFree.argtypes = [wintypes.HANDLE]
+_k32.GlobalFree.restype = wintypes.HANDLE
+
+_s32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+_s32.DragQueryFileW.restype = wintypes.UINT
+
+
+def _open_clip(tries=CLIP_OPEN_TRIES, wait=0.05):
+    """占住剪贴板（重试 tries 次）。返回 True 时必须配 _close_clip()。"""
+    for _ in range(tries):
+        if _u32.OpenClipboard(None):
             return True
-        except Exception:
-            time.sleep(0.05)
+        time.sleep(wait)
     return False
+
+
+def _close_clip():
+    try:
+        _u32.CloseClipboard()
+    except Exception:
+        pass
+
+
+def _clip_has(fmt):
+    return bool(_u32.IsClipboardFormatAvailable(fmt))
+
+
+def _clip_get(fmt):
+    """取回指定格式的原始字节；无此格式/失败返回 None。需在 _open_clip() 之后调用。"""
+    h = _u32.GetClipboardData(fmt)
+    if not h:
+        return None
+    p = _k32.GlobalLock(h)
+    if not p:
+        return None
+    try:
+        size = int(_k32.GlobalSize(h))
+        return ctypes.string_at(p, size) if size else b''
+    except Exception:
+        return None
+    finally:
+        _k32.GlobalUnlock(h)
+
+
+def _clip_set(fmt, data):
+    """把字节写进剪贴板指定格式。成功返回 True（内存所有权交给系统，绝不能再 free）。"""
+    if not isinstance(data, (bytes, bytearray)):
+        data = bytes(data)
+    h = _k32.GlobalAlloc(GMEM_MOVEABLE, max(1, len(data)))
+    if not h:
+        return False
+    p = _k32.GlobalLock(h)
+    if not p:
+        _k32.GlobalFree(h)
+        return False
+    try:
+        if data:
+            ctypes.memmove(p, bytes(data), len(data))
+    finally:
+        _k32.GlobalUnlock(h)
+    if _u32.SetClipboardData(fmt, h):
+        return True
+    _k32.GlobalFree(h)          # 写失败时句柄仍归我们，必须自己释放，否则每次泄漏一块全局内存
+    return False
+
+
+def _clip_publish(write_cb):
+    """开剪贴板 → 清空 → 由 write_cb 写各格式 → 关；整体重试 CLIP_SET_TRIES 次。
+
+    剪贴板是全局单一资源，ToDesk/Deskflow 这类监听者会在每次变化时抢着 Open，
+    因此「打开成功但写失败」属正常竞争，重试即可，不能当致命错误抛出。
+    """
+    for attempt in range(CLIP_SET_TRIES):
+        ok = False
+        if _open_clip():
+            try:
+                if _u32.EmptyClipboard():
+                    ok = bool(write_cb())
+            except Exception as e:
+                log.warning('写剪贴板异常（第 %d 次）: %r', attempt + 1, e)
+            finally:
+                _close_clip()
+        if ok:
+            return True
+        time.sleep(0.03 * (attempt + 1))
+    return False
+
+
+def _dropfiles_payload(paths):
+    """CF_HDROP 的 DROPFILES 结构 + 双 NUL 结尾的宽字符路径表。"""
+    files = ''.join(p + '\0' for p in paths) + '\0'
+    return struct.pack('<IiiII', 20, 0, 0, 0, 1) + files.encode('utf-16-le')
+
+
+def _read_files_locked():
+    """在已打开剪贴板的前提下读 CF_HDROP 路径列表。"""
+    if not _clip_has(CF_HDROP):
+        return []
+    h = _u32.GetClipboardData(CF_HDROP)
+    if not h:
+        return []
+    n = int(_s32.DragQueryFileW(h, 0xFFFFFFFF, None, 0))
+    out = []
+    for i in range(min(n, 4096)):
+        ln = int(_s32.DragQueryFileW(h, i, None, 0))
+        if ln <= 0:
+            continue
+        buf = ctypes.create_unicode_buffer(ln + 1)
+        if _s32.DragQueryFileW(h, i, buf, ln + 1) and buf.value:
+            out.append(buf.value)
+    return out
 
 
 def read_clipboard_files():
     """返回剪贴板里的文件/目录绝对路径列表；非 CF_HDROP 返回 []。"""
-    import win32clipboard, win32con
     if not _open_clip():
         return []
     try:
-        if not win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
-            return []
-        data = win32clipboard.GetClipboardData(win32con.CF_HDROP)
-        # 兜底过滤空条目（Deskflow 空剪贴板回灌可能 marshall 出空 furl 列表）
-        return [p for p in data if p] if data else []
+        return _read_files_locked()
     except Exception:
         return []
     finally:
-        try:
-            win32clipboard.CloseClipboard()
-        except Exception:
-            pass
+        _close_clip()
 
 
 def write_clipboard_files(paths):
     """写 CF_HDROP + Preferred DropEffect(Copy)。两者是两个独立格式，各 SetClipboardData 一次。"""
-    import win32clipboard, win32con
-    files = ''.join(p + '\0' for p in paths) + '\0'
-    payload = struct.pack('<IiiII', 20, 0, 0, 0, 1) + files.encode('utf-16-le')
-    cf_effect = win32clipboard.RegisterClipboardFormat('Preferred DropEffect')
-    if not _open_clip():
-        return False
-    try:
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardData(win32con.CF_HDROP, payload)
-        win32clipboard.SetClipboardData(cf_effect, struct.pack('<I', DROPEFFECT_COPY))
-        return True
-    finally:
-        try:
-            win32clipboard.CloseClipboard()
-        except Exception:
-            pass
+    payload = _dropfiles_payload(paths)
+    cf_effect = int(_u32.RegisterClipboardFormatW('Preferred DropEffect'))
+    effect = struct.pack('<I', DROPEFFECT_COPY)
+
+    def _write():
+        if not _clip_set(CF_HDROP, payload):
+            return False
+        return _clip_set(cf_effect, effect) if cf_effect else True
+
+    return _clip_publish(_write)
 
 
 def clip_seq():
-    import win32clipboard
-    return win32clipboard.GetClipboardSequenceNumber()
+    return int(_u32.GetClipboardSequenceNumber())
 
 
 def sha1_bytes(b):
@@ -388,42 +520,33 @@ def read_clipboard_payload():
     优先级 files > image > text（与 Mac 侧约定一致）：带文件的复制通常同时带一份文本表示，
     按文本发就丢掉了文件语义。
     """
-    import win32clipboard, win32con
     if not _open_clip():
         return None
     try:
-        if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
-            try:
-                data = win32clipboard.GetClipboardData(win32con.CF_HDROP)
-            except Exception:
-                data = None
-            paths = [p for p in data if p] if data else []
-            if paths:
-                return {'kind': 'files', 'paths': paths}
+        paths = _read_files_locked()
+        if paths:
+            return {'kind': 'files', 'paths': paths}
 
-        if win32clipboard.IsClipboardFormatAvailable(win32con.CF_DIB):
-            try:
-                dib = win32clipboard.GetClipboardData(win32con.CF_DIB)
-            except Exception:
-                dib = None
+        if _clip_has(CF_DIB):
+            dib = _clip_get(CF_DIB)
             png = dib_to_png(dib) if dib else None
             if png:
                 return {'kind': 'image', 'png': png, 'fp': 'image:' + sha1_bytes(png)}
 
-        if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
-            try:
-                text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
-            except Exception:
-                text = None
-            if text:
-                return {'kind': 'text', 'text': text,
-                        'fp': 'text:' + sha1_bytes(text.encode('utf-8'))}
+        if _clip_has(CF_UNICODETEXT):
+            raw = _clip_get(CF_UNICODETEXT)
+            if raw:
+                # CF_UNICODETEXT 是「UTF-16LE + 结尾 NUL」，按第一个 NUL 截断
+                text = raw.decode('utf-16-le', 'ignore').split('\x00')[0]
+                if text:
+                    return {'kind': 'text', 'text': text,
+                            'fp': 'text:' + sha1_bytes(text.encode('utf-8'))}
+        return None
+    except Exception as e:
+        log.warning('读剪贴板异常: %r', e)
         return None
     finally:
-        try:
-            win32clipboard.CloseClipboard()
-        except Exception:
-            pass
+        _close_clip()
 
 
 def payload_fp(payload):
@@ -437,39 +560,23 @@ def payload_fp(payload):
 
 
 def write_clipboard_text(text):
-    import win32clipboard, win32con
-    if not _open_clip():
-        return False
-    try:
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
-        return True
-    finally:
-        try:
-            win32clipboard.CloseClipboard()
-        except Exception:
-            pass
+    data = text.encode('utf-16-le') + b'\x00\x00'
+    return _clip_publish(lambda: _clip_set(CF_UNICODETEXT, data))
 
 
 def write_clipboard_image(png):
     """CF_DIB 为主（Word/画图认），再补一个注册格式 'PNG'（浏览器一类偏好它）。"""
-    import win32clipboard, win32con
     dib = png_to_dib(png)
     if not dib:
         return False
-    cf_png = win32clipboard.RegisterClipboardFormat('PNG')
-    if not _open_clip():
-        return False
-    try:
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardData(win32con.CF_DIB, dib)
-        win32clipboard.SetClipboardData(cf_png, png)
-        return True
-    finally:
-        try:
-            win32clipboard.CloseClipboard()
-        except Exception:
-            pass
+    cf_png = int(_u32.RegisterClipboardFormatW('PNG'))
+
+    def _write():
+        if not _clip_set(CF_DIB, dib):
+            return False
+        return _clip_set(cf_png, png) if cf_png else True
+
+    return _clip_publish(_write)
 
 
 def write_clipboard_files_heal(paths, bridge=None):
@@ -779,6 +886,145 @@ _PUSH_ECHO = set()
 _PUSH_FILES = []
 _PUSH_LOCK = threading.Lock()
 
+# ---- 跨屏闸门（2026-10-22 用户定的新口径）--------------------------------
+# 只在「鼠标刚跨过屏幕」这一刻做一次单向传输：离屏方把剪贴板推给进屏方。
+#   win -> mac：此刻把本机剪贴板整块推过去
+#   mac -> win：把对端推来、已暂存的最新一条写进本机剪贴板
+# 平时两边各自复制互不干扰：不再边复制边同步（原先对端一变就覆盖本机剪贴板，
+# 本机正在复制/粘贴的内容会被打断）。
+CROSS_ONLY = True
+# 新鲜度门限：只有「更新后 60 秒内」的剪贴板才跟着鼠标跨屏走。
+# 依据是 GetClipboardSequenceNumber 的变化时刻 —— 很久没变的内容属于陈旧内容，
+# 跨屏带过去只会覆盖对端剪贴板，反而碍事。
+CLIP_FRESH_SEC = 60.0
+_PENDING_CLIP = []          # [(name, blob, ts, basis)] 已收到但还没落地的对端剪贴板
+_PENDING_MAX = 8            # 只留最近几条：跨回本机时只有最新一条有意义
+
+
+def peer_clip_ts(name, recv_ts=None):
+    """推算对端剪贴板的更新时刻。返回 (ts, 依据)。
+
+    条目名 `cb_YYYYMMDD-HHMMSS-mmm_{win|mac}_{text|image}.{txt|png}` 自带毫秒时间戳，
+    优先用它；两端时钟偏差离谱（对方超前 5 分钟以上 / 退后超过一天）时退回本地接收时间。
+    """
+    now = time.time() if recv_ts is None else recv_ts
+    m = RE_CB_NAME.match(name or '')
+    if m:
+        try:
+            ts = time.mktime(time.strptime(m.group(1)[:15], '%Y%m%d-%H%M%S'))
+            drift = now - ts
+            if -300.0 <= drift <= 86400.0:
+                return ts + float(m.group(1)[16:] or 0) / 1000.0, 'name'
+            log.warning('对端剪贴板时间戳偏差 %.0f 秒（疑似时钟不同步），改用本地接收时间', drift)
+        except Exception:
+            pass
+    return now, 'recv'
+
+
+def stash_pending_clip(name, blob, recv_ts=None):
+    """暂存对端推来的剪贴板，等鼠标跨回本机再落地。
+
+    同时记下「这条内容是对方哪一刻写的」，落地时用它判断是否已经陈旧。
+    """
+    ts, basis = peer_clip_ts(name, recv_ts)
+    with _PUSH_LOCK:
+        _PENDING_CLIP.append((name, blob, ts, basis))
+        if len(_PENDING_CLIP) > _PENDING_MAX:
+            del _PENDING_CLIP[:-_PENDING_MAX]
+        n = len(_PENDING_CLIP)
+    log.info('收到对端剪贴板 %s（%d B，更新于 %.0f 秒前，依据=%s），暂存等跨屏落地；待落地 %d 条',
+             name, len(blob), max(0.0, time.time() - ts), basis, n)
+
+
+def apply_pending_clip(st):
+    """跨回本机时，把暂存的最新一条对端剪贴板写进本机剪贴板。
+
+    只有「对端 60 秒内更新过」的那条才落地；更旧的直接丢弃，避免把上次会话的
+    残留内容糊进本机剪贴板。
+    """
+    with _PUSH_LOCK:
+        if not _PENDING_CLIP:
+            return False
+        name, blob, ts, basis = _PENDING_CLIP[-1]
+        dropped = len(_PENDING_CLIP) - 1
+        del _PENDING_CLIP[:]
+    age = max(0.0, time.time() - ts)
+    if age > CLIP_FRESH_SEC:
+        log.info('跨屏：对端剪贴板已 %.0f 秒没更新（阈值 %.0f 秒，依据=%s），按陈旧内容丢弃%s',
+                 age, CLIP_FRESH_SEC, basis,
+                 '（另丢弃 %d 条更旧的）' % dropped if dropped else '')
+        return False
+    ok, what = apply_clip_blob(name, blob)
+    if not ok:
+        log.error('跨屏落地失败 %s: %s', name, what)
+        return False
+    fp = ('text:' + sha1_bytes(blob)) if name.endswith('.txt') else payload_fp(read_clipboard_payload())
+    st['self_seq'] = clip_seq()
+    st['self_fp'] = fp
+    st['last_seq'] = st['self_seq']
+    st['last_fp'] = fp
+    log.info('跨屏落地：对端剪贴板%s已写入本机（%s）%s', what, name,
+             '；丢弃 %d 条更旧的' % dropped if dropped else '')
+    return True
+
+
+def push_clip_snapshot(st):
+    """跨到对端时，把本机当前剪贴板整块推过去（files > image > text）。
+
+    前置门限：本机剪贴板必须在 CLIP_FRESH_SEC（60 s）内更新过。很久没变的内容是
+    陈旧内容，跨屏带过去只会覆盖对端剪贴板 —— 这正是「不要频繁传输」的一半来源。
+    """
+    age = time.time() - float(st.get('clip_ts') or 0.0)
+    if age > CLIP_FRESH_SEC:
+        log.info('跨屏：本机剪贴板已 %.0f 秒没更新（阈值 %.0f 秒），按陈旧内容跳过',
+                 age, CLIP_FRESH_SEC)
+        return False
+    payload = read_clipboard_payload()
+    if payload is None:
+        log.info('跨屏：本机剪贴板为空或格式不认识，不发')
+        return False
+    fp = payload_fp(payload)
+    if fp == st.get('self_fp'):
+        log.info('跨屏：本机剪贴板正是对端送来的内容，不回推')
+        return False
+    if payload['kind'] == 'image' and len(payload.get('png') or b'') > CLIP_IMAGE_MAX:
+        log.warning('跨屏：图片 %d B 超上限，跳过', len(payload['png']))
+        return False
+    if payload['kind'] == 'files' and _DRAG_SRC_ON:
+        log.info('跨屏：拖拽会话进行中，剪贴板文件交由拖拽协议处理，跳过')
+        return False
+    st['last_fp'] = fp
+    enqueue_clip_payload(payload)
+    log.info('跨屏 -> 对端：已提交本机剪贴板（%s）', payload['kind'])
+    return True
+
+
+def cross_beat(st, active=None):
+    """跨屏闸门：识别「刚跨屏」这一瞬，触发一次单向传输。"""
+    cur = active if active is not None else active_screen_from_log()
+    if cur is None:
+        # core 每次启动都会用 `>` 截断 core-server.log：没有切屏记录时用本机光标校正，
+        # 免得沿用上一个生命周期的 last_active，把真正的第一次跨屏当成「没变化」吞掉。
+        pt = draghook.cursor_pos()
+        if pt:
+            st['last_active'] = 'mac' if cursor_parked(pt) else 'win'
+        return
+    prev = st.get('last_active')
+    if cur == prev:
+        return
+    st['last_active'] = cur
+    if prev is None:
+        log.info('跨屏闸门：当前活动屏=%s（首个采样，不触发传输）', cur)
+        return
+    log.info('跨屏事件：%s -> %s', prev, cur)
+    if not CROSS_ONLY:
+        return
+    if cur == 'mac':
+        push_clip_snapshot(st)
+    else:
+        apply_pending_clip(st)
+
+
 
 def remember_pushed(name):
     """登记「这条已落地」。返回 False 表示之前就落地过（幂等跳过）。"""
@@ -911,11 +1157,16 @@ CURSOR_MASK_MAX_SEC = 120.0   # 连续屏蔽上限，超过强制恢复（防日
 
 # 源端（Win→Mac）：本机做源，Mac 做目标端。源判定见 draghook（GetGUIThreadInfo capture）。
 _DRAG_SRC_Q = queue.Queue()
-_DRAG_SRC = {'id': None, 'ts': 0.0, 'qnames': []}    # 当前源端会话（单会话）
+# 'sent'   —— begin 是否已发（False = 只做了本地准备，Mac 那边完全不知道有这次拖拽）
+# 'pre'    —— 预传完成信号（threading.Event）；松手时用它等载荷到齐再发 drop
+_DRAG_SRC = {'id': None, 'ts': 0.0, 'qnames': [], 'items': [], 'sent': False, 'pre': None}
 _DRAG_SRC_ON = False                                 # 钩子线程只读该原子布尔，避免加锁
 _DRAG_CROSSED = False                                # 本次拖拽是否触及过跨屏边界（钩子线程写、worker 读）
 DRAG_SRC_COOLDOWN = 5.0                              # 会话结束后冷却，避免连点重复触发
 DRAG_SRC_TTL = 30.0                                  # 源端会话最长存活
+CROSS_CONFIRM_SEC = 0.8                              # 触到边界后，等 Deskflow 日志确认切到 MAC 的上限
+CROSS_POLL_SEC = 0.04                                # 确认期间读日志的间隔
+DRAG_PRE_WAIT = 15.0                                 # 松手时等预传完成的极限秒数
 
 # 松手时"活动屏在哪"由 Deskflow 服务端日志判定：Deskflow 不把 Win 起手的拖拽按键状态转发给
 # Mac（Mac 实测 btn 恒为 0，本地测不到 LEFT-UP），故落点触发必须由 Windows 侧发。
@@ -967,14 +1218,14 @@ def _resolve_drop_point(x, y):
     return rx, ry
 
 
-def mask_cursor_if_on_peer():
+def mask_cursor_if_on_peer(active=None):
     """指针落在对端 Mac 屏时隐藏本机光标，回到本机屏再恢复。
 
     Deskflow 把「不在本机屏」的光标停放在虚拟屏正中（屏心很难看、也干扰落点观察），
     故按 Deskflow 日志推断的活动屏来屏蔽/恢复。另设 CURSOR_MASK_MAX_SEC 兜底：
     日志陈旧或读不到时，连续屏蔽超时即强制恢复，避免留下永久无光标。
     """
-    active = active_screen_from_log()
+    active = active if active is not None else active_screen_from_log()
     if active == 'win':
         _CURSOR_MASK_BLOCK[0] = False        # 见到本机屏，解除屏蔽禁令
     if active == 'mac' and not _CURSOR_MASK_BLOCK[0]:
@@ -1278,7 +1529,13 @@ def _drag_src_pretransfer(did, items):
 
 
 def _drag_src_start(bridge, cap):
-    """源端拖拽开始：解析 Explorer 选中项 → 生成 drag_id/清单 → 发 drag_begin → 后台预传。"""
+    """源端按下拖动：**只做本地准备，不发任何信令**。
+
+    口径（2026-10-24 用户要求）：本机长按拖动不发给 Mac，必须等光标真正越过屏幕分界线
+    （钩子报 'edge' 且 Deskflow 日志确认已切到 MAC）才发 drag_begin 并开始预传。
+    这里保留的准备工作（解析 Explorer 选中项、目录打包、算 sha256）只读本地磁盘，
+    不产生任何网络流量，提前做完可缩短越界后的等待。
+    """
     global _DRAG_SRC_ON
     now = time.time()
     with _DRAG_LOCK:
@@ -1309,6 +1566,20 @@ def _drag_src_start(bridge, cap):
         items.append({'name': qn, 'orig': on, 'kind': 'file',
                       'size': os.path.getsize(lp), 'sha256': sha256_file(lp),
                       'path': lp, 'temp': t})
+    with _DRAG_LOCK:
+        _DRAG_SRC.update({'id': did, 'ts': time.time(),
+                          'qnames': [it['name'] for it in items],
+                          'items': items, 'sent': False, 'pre': None})
+    _DRAG_SRC_ON = True
+    log.info('拖拽源端：本地已就绪 %s（%d 个载荷），未发送 —— 等越过屏幕分界线', did, len(items))
+
+
+def _drag_src_begin_send(bridge, did, items, why='', sync=False):
+    """发 drag_begin 并预传载荷。sync=True 时在当前线程内等预传跑完（极少用，见 release）。
+
+    返回 True 表示 begin 已发出；发送失败会清掉本机会话（对端从未收到 begin，不能留悬挂会话）。
+    """
+    global _DRAG_SRC_ON
     vx, vy, vw, vh = draghook.virtual_screen_rect()
     doc = {'id': did, 'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'source': 'win',
            'count': len(items),
@@ -1316,30 +1587,85 @@ def _drag_src_start(bridge, cap):
            'screen': {'x': vx, 'y': vy, 'w': vw, 'h': vh},
            'items': [{k: it[k] for k in ('name', 'orig', 'kind', 'size', 'sha256')}
                      for it in items]}
-    with _DRAG_LOCK:
-        _DRAG_SRC.update({'id': did, 'ts': time.time(), 'qnames': [it['name'] for it in items]})
-    _DRAG_SRC_ON = True
     try:
         send_bytes(bridge, 'drag_%s_begin.json' % did,
                    json.dumps(doc, ensure_ascii=False).encode('utf-8'))
-        log.info('拖拽源端：已发 drag_begin %s（%d 个载荷）', did, len(items))
     except Exception as e:
-        log.error('拖拽源端：drag_begin 发送失败: %r', e)
+        log.error('拖拽源端：drag_begin 发送失败（%s）: %r', why or 'start', e)
         with _DRAG_LOCK:
-            _DRAG_SRC.update({'id': None, 'ts': time.time()})
+            _DRAG_SRC.update({'id': None, 'ts': time.time(), 'items': [],
+                              'sent': False, 'pre': None})
         _DRAG_SRC_ON = False
+        return False
+    ev = threading.Event()
+    with _DRAG_LOCK:
+        _DRAG_SRC.update({'sent': True, 'pre': ev})
+    log.info('拖拽源端：%s，已发 drag_begin %s（%d 个载荷）', why or '开始', did, len(items))
+    if sync:
+        try:
+            _drag_src_pretransfer(did, items)
+        finally:
+            ev.set()
+    else:
+        def _runner():
+            try:
+                _drag_src_pretransfer(did, items)
+            finally:
+                ev.set()
+        threading.Thread(target=_runner, daemon=True).start()
+    return True
+
+
+def _drag_src_cross(bridge, x, y):
+    """钩子报「按住期间触到屏幕下边界」→ 确认真的切到 Mac 后，才发 begin + 开始预传。
+
+    只触边不切屏（贴着底边走、或 Mac 未连接）时什么都不发，本次拖拽对 Mac 完全不存在。
+    """
+    with _DRAG_LOCK:
+        did = _DRAG_SRC['id']
+        sent = _DRAG_SRC.get('sent')
+        items = list(_DRAG_SRC.get('items') or [])
+    if not did or sent or not items:
         return
-    threading.Thread(target=_drag_src_pretransfer, args=(did, items), daemon=True).start()
+    deadline = time.time() + CROSS_CONFIRM_SEC
+    active = active_screen_from_log()
+    while active != 'mac' and time.time() < deadline:
+        time.sleep(CROSS_POLL_SEC)
+        active = active_screen_from_log()
+    if active != 'mac':
+        log.info('拖拽源端：触到屏幕分界线但未确认切到 Mac（active=%s），不发送', active or '未知')
+        return
+    _drag_src_begin_send(bridge, did, items, why='已越过屏幕分界线到 Mac')
 
 
 def _drag_src_cancel(bridge, reason='back-to-source'):
-    """源端取消（拖拽中断 / 松手回源屏）：发 drag_cancel，清本机会话。"""
+    """源端取消（拖拽中断 / 松手回源屏）。
+
+    只有已发过 drag_begin 的会话才需要通知对端发 drag_cancel；从未越界的会话对 Mac
+    完全不存在（连 begin 都没发），这里只清本地状态并删掉临时打包的 zip。
+    """
     global _DRAG_SRC_ON
     with _DRAG_LOCK:
         did = _DRAG_SRC['id']
-        _DRAG_SRC.update({'id': None, 'ts': time.time()})
+        sent = bool(_DRAG_SRC.get('sent'))
+        items = list(_DRAG_SRC.get('items') or [])
+        _DRAG_SRC.update({'id': None, 'ts': time.time(), 'items': [],
+                          'sent': False, 'pre': None})
     _DRAG_SRC_ON = False
     if not did:
+        return
+    if not sent:
+        # 未发送：本地清理即可，别给对端发无主的 cancel
+        n = 0
+        for it in items:
+            if it.get('temp'):
+                try:
+                    os.remove(it['path'])
+                    n += 1
+                except OSError:
+                    pass
+        log.info('拖拽源端：会话 %s 全程未越过屏幕分界线，未发送任何数据%s（reason=%s）',
+                 did, '，已清理临时包 %d 个' % n if n else '', reason)
         return
     vx, vy, vw, vh = draghook.virtual_screen_rect()
     doc = {'id': did, 'reason': reason,
@@ -1356,25 +1682,38 @@ def _drag_src_cancel(bridge, reason='back-to-source'):
 def _drag_src_release(bridge, x, y):
     """源端物理松手：按 Deskflow 当前活动屏决定去向。
 
-    活动屏 == Mac → 发 drag_drop（落点交给 Mac：它收到后立刻读本地光标坐标做 AX 命中），
-    并保留会话直到收到 sync 回执；否则说明拖回/未跨到 Mac → 发 cancel(dropped-on-source)。
+    活动屏 == Mac → 先确保 begin 已发、载荷已到 Mac 暂存区，再发 drag_drop
+    （落点交给 Mac：它收到后立刻读本地光标坐标做 AX 命中）；
+    否则说明拖回本屏 → 清本地；若本次从未越界，则 Mac 侧连 begin 都没收到过。
     """
     with _DRAG_LOCK:
         did = _DRAG_SRC['id']
+        sent = bool(_DRAG_SRC.get('sent'))
+        items = list(_DRAG_SRC.get('items') or [])
+        pre = _DRAG_SRC.get('pre')
     if not did:
         return
     active = active_screen_from_log()
-    if active == 'mac':
-        doc = {'id': did, 'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'source': 'win'}
-        try:
-            send_bytes(bridge, 'drag_%s_drop.json' % did,
-                       json.dumps(doc, ensure_ascii=False).encode('utf-8'))
-            log.info('拖拽源端：松手于 Mac 屏，已发 drag_drop %s（落点由 Mac 本地决定）', did)
-        except Exception as e:
-            log.error('拖拽源端：drag_drop 发送失败: %r', e)
+    if active != 'mac':
+        log.info('拖拽源端：松手时活动屏=%s，按回源处理', active or '未知')
+        _drag_src_cancel(bridge, reason='dropped-on-source')
         return
-    log.info('拖拽源端：松手时活动屏=%s，按回源处理', active or '未知')
-    _drag_src_cancel(bridge, reason='dropped-on-source')
+    if not sent:
+        # 极快穿越：edge 的确认窗口还没走完就松手了。补发 begin 并同步跑完预传，
+        # 保证 drag_drop 到达 Mac 时暂存区的载荷已经完整（避免半包）。
+        log.info('拖拽源端：松手已在 Mac 屏但此前未发送，补发 drag_begin')
+        if not _drag_src_begin_send(bridge, did, items, why='松手补发（快速穿越）', sync=True):
+            return
+    elif pre is not None and not pre.wait(DRAG_PRE_WAIT):
+        log.warning('拖拽源端：预传未在 %.0fs 内完成，仍发 drag_drop（Mac 侧按 sha256 校验载荷）',
+                    DRAG_PRE_WAIT)
+    doc = {'id': did, 'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'source': 'win'}
+    try:
+        send_bytes(bridge, 'drag_%s_drop.json' % did,
+                   json.dumps(doc, ensure_ascii=False).encode('utf-8'))
+        log.info('拖拽源端：松手于 Mac 屏，已发 drag_drop %s（落点由 Mac 本地决定）', did)
+    except Exception as e:
+        log.error('拖拽源端：drag_drop 发送失败: %r', e)
 
 
 def _drag_src_worker():
@@ -1389,6 +1728,8 @@ def _drag_src_worker():
             try:
                 if ev[0] == 'start':
                     _drag_src_start(b, ev[3])
+                elif ev[0] == 'edge':
+                    _drag_src_cross(b, ev[1], ev[2])
                 elif ev[0] == 'release':
                     _drag_src_release(b, ev[1], ev[2])
                 elif ev[0] == 'cancel':
@@ -1411,7 +1752,9 @@ def _drag_on_event(ev, x, y, injected, cap):
                 if len(_CUR_TRACE) > _CUR_TRACE_CAP:
                     del _CUR_TRACE[:len(_CUR_TRACE) - _CUR_TRACE_CAP]
         elif ev == 'edge' and not injected:
-            _DRAG_CROSSED = True                          # 触到跨屏边界，可能已到 Mac
+            # 按住期间触到屏幕分界线：真的跨过去才发送（确认交给 worker 读 Deskflow 日志）
+            _DRAG_CROSSED = True
+            _DRAG_SRC_Q.put_nowait(('edge', int(x), int(y), 0, time.time()))
         elif ev == 'up':
             if injected:
                 if draghook.point_in_windows((x, y)):     # 目标端：注入 LEFT-UP 落本屏 → 投放
@@ -1607,20 +1950,26 @@ class PushHandler(BaseHTTPRequestHandler):
             if is_cb:
                 with open(part, 'rb') as f:
                     blob = f.read()
-                ok, detail = apply_clip_blob(name, blob)
-                if not ok:
-                    forget_pushed(name)                # 没落地就让对端重推
-                    return self._reply(422, {'ok': False, 'error': detail})
-                if name.endswith('.txt'):
-                    fp = 'text:' + sha1_bytes(blob)
+                if CROSS_ONLY:
+                    # 只在跨屏时落地：先收下暂存，等鼠标跨回本机再写剪贴板
+                    stash_pending_clip(name, blob)
+                    action = 'clipboard'
+                    log.info('直达推送：对端剪贴板 %s（%d B）已暂存，等跨屏落地', name, len(blob))
                 else:
-                    # 图片经 PNG<->DIB 往返字节会变，按真正落到剪贴板的内容取指纹
-                    fp = payload_fp(read_clipboard_payload())
-                if fp:
-                    with _PUSH_LOCK:
-                        _PUSH_ECHO.add(fp)
-                action = 'clipboard'
-                log.info('直达推送：已把对端剪贴板%s写入本机剪贴板（%s）', detail, name)
+                    ok, detail = apply_clip_blob(name, blob)
+                    if not ok:
+                        forget_pushed(name)                # 没落地就让对端重推
+                        return self._reply(422, {'ok': False, 'error': detail})
+                    if name.endswith('.txt'):
+                        fp = 'text:' + sha1_bytes(blob)
+                    else:
+                        # 图片经 PNG<->DIB 往返字节会变，按真正落到剪贴板的内容取指纹
+                        fp = payload_fp(read_clipboard_payload())
+                    if fp:
+                        with _PUSH_LOCK:
+                            _PUSH_ECHO.add(fp)
+                    action = 'clipboard'
+                    log.info('直达推送：已把对端剪贴板%s写入本机剪贴板（%s）', detail, name)
             elif is_drag_sig:
                 with open(part, 'rb') as f:
                     blob = f.read()
@@ -2101,6 +2450,16 @@ def handle_clip_incoming(bridge, st, name, size):
     except Exception as e:
         log.error('cb 内容读取失败 %s: %r', name, e)
         return
+    if CROSS_ONLY:
+        # 只在跨屏时落地：内容先收下暂存，等鼠标跨回本机再写剪贴板
+        stash_pending_clip(name, blob)
+        try:
+            res = bridge.ack(QUEUE_IN, name)
+            st['processed'].append(name)
+            log.info('队列副本已暂存待跨屏落地并 ack: %s -> %s', name, res.get('moved_to'))
+        except Exception as e:
+            log.warning('暂存后 ack 失败 %s（下轮重复暂存即覆盖为最新）: %r', name, e)
+        return
     ok, what = apply_clip_blob(name, blob)
     if not ok:
         log.error('cb 落地失败 %s: %s（内容保留在队列里，下轮重试）', name, what)
@@ -2188,14 +2547,36 @@ def handle_incoming(bridge, st, name, size):
 
 # ---------------------------------------------------------------- 主循环
 
+def touch_clip_freshness(st):
+    """记录本机剪贴板最后一次变化的时刻（只读序列号，不打开剪贴板、不读内容）。
+
+    CROSS_ONLY 下这是判断「这份剪贴板值不值得带过屏」的唯一依据。首次采样只登记
+    序号、不置新鲜 —— 进程刚起来时剪贴板里是什么时候的货色无从判断，按陈旧处理更安全。
+    """
+    seq = clip_seq()
+    if not seq or seq == st.get('last_seq'):
+        return
+    prev = st.get('last_seq')
+    st['last_seq'] = seq
+    if prev is not None and prev >= 0:
+        st['clip_ts'] = time.time()
+
+
 def local_beat(bridge, st):
-    """本地节奏（0.25 s）：只碰本机剪贴板，零网络成本。
+    """本地节奏（0.25 s）：跨屏闸门 + 落地消费，本身零网络成本。
 
     快路收到的东西由接收线程登记，这里消费掉 —— 保证剪贴板与 st 记账始终在单线程里发生。
+    CROSS_ONLY 下不再轮询本机剪贴板的内容变化（那是「边复制边同步」的老口径），
+    改为盯着 Deskflow 日志里的活动屏变化，只在跨屏那一刻取一次快照。
     """
-    check_clipboard(bridge, st)
+    active = active_screen_from_log()
+    if CROSS_ONLY:
+        touch_clip_freshness(st)             # 只读序号，决定这份剪贴板是否还「新鲜」
+        cross_beat(st, active)
+    else:
+        check_clipboard(bridge, st)
     drain_pushed_files(bridge, st)
-    mask_cursor_if_on_peer()
+    mask_cursor_if_on_peer(active)
     if _DRAG_SESSIONS:                       # armed 期间每秒采样本机光标+活动屏（诊断跨屏跟手）
         now = time.time()
         if now - _DRAG_TRACE_LAST[0] >= 1.0:
@@ -2252,8 +2633,8 @@ def run_forever():
     threading.Thread(target=_drag_src_worker, daemon=True).start()    # 拖拽源端（Win→Mac 预传/取消）
     _drag_hook = draghook.DragHook(_drag_on_event, log)              # 全局鼠标观测，永不拦截
     _drag_hook.start()
-    log.info('clipwatch 启动：base=%s 本地剪贴板=%ss 队列兜底=%ss 快路=%s',
-             BASE, LOCAL_CLIP_SEC, POLL_SEC,
+    log.info('clipwatch 启动：pid=%d ppid=%d base=%s 本地剪贴板=%ss 队列兜底=%ss 快路=%s',
+             os.getpid(), os.getppid(), BASE, LOCAL_CLIP_SEC, POLL_SEC,
              ('监听 0.0.0.0:%d + 直连 %s:%d/api/push' % (PUSH_PORT, PEER_HOST, PEER_PUSH_PORT))
              if srv else '未启用（只用队列）')
     last_full = 0.0
@@ -2282,8 +2663,24 @@ def msgbox(title, text):
 
 
 def main(argv):
+    # pythonw 下任何崩溃都无痕：faulthandler 把 native 崩溃 / 死锁栈直接落盘（logs/fault.log）
+    try:
+        import faulthandler
+        os.makedirs(DIR_LOGS, exist_ok=True)
+        _fault_fh = open(os.path.join(DIR_LOGS, 'fault.log'), 'a', encoding='utf-8', buffering=1)
+        faulthandler.enable(_fault_fh)
+        globals()['_FAULT_FH'] = _fault_fh        # 保引用：fd 不能被 GC 关掉
+    except Exception:
+        pass
     if sys.stdout is None:      # pythonw 启动时无控制台
         sys.stdout = open(os.devnull, 'w')
+    if sys.stderr is None:      # pythonw 下 stderr 也是 None：任何 warning / 线程异常写它都会把进程打死
+        try:
+            os.makedirs(DIR_LOGS, exist_ok=True)
+            sys.stderr = open(os.path.join(DIR_LOGS, 'stderr.log'), 'a',
+                              encoding='utf-8', buffering=1)
+        except Exception:
+            sys.stderr = open(os.devnull, 'w')
     cmd = argv[1] if len(argv) > 1 else ''
     if cmd == '--selftest-clip':
         setup_logging(verbose_console=True)
@@ -2400,3 +2797,13 @@ if __name__ == '__main__':
         sys.exit(main(sys.argv))
     except KeyboardInterrupt:
         sys.exit(0)
+    except SystemExit:
+        raise
+    except BaseException:
+        # 顶层兜底：pythonw 下没有控制台，未捕获异常必须自己写日志，否则进程静默消失
+        try:
+            setup_logging()
+            log.exception('clipwatch 顶层异常退出（pid=%d）', os.getpid())
+        except Exception:
+            pass
+        raise
