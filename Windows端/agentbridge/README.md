@@ -5,7 +5,12 @@
 对照 Mac 侧详解见 `../../mac端/agentbridge/README.md`。
 
 - 控制层（键鼠）见 `../deskflow/`；本目录只讲双向传输。
-- 本端实现是一个**单进程**：`clipwatch.py`（约 1500 行，纯标准库 + `pywin32`）。
+- 本端实现是一个**单进程**：`../clipwatch.py`（约 2800 行，纯标准库；仅命名互斥体用到
+  `win32event` / `win32api`，剪贴板层已改为 ctypes 直调 Win32）。
+
+> ⚠ **本目录内的 `clipwatch.py` 是 2026-10-02 的旧一代副本，仅作历史留档，勿用。**
+> 两份同名不同物：现行版本是上一行指的那个 `../clipwatch.py`，部署与排障一律以它为准。
+> 同理，本目录的 `run-clipwatch.cmd` / `run-clipwatch-hidden.vbs` 与顶层同名文件完全相同，属重复留档。
 
 ---
 

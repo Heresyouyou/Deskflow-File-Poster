@@ -18,13 +18,20 @@
 ```
 Windows端/
 ├── README.md                     ← 本文件：Windows 端总览 + 最短上手路径
-├── agentbridge/                  ← 双向传输：Windows 端全部源码
+├── clipwatch.py                  ← **常驻主程序（现行版本，与实机一致）**，单进程：
+│                                   出站轮询 + 剪贴板守护 + 投递箱监听
+│                                   + 协议 v2 直达推送接收器（监听 8900）
+├── draghook.py                   ← 全局鼠标钩子：观测拖拽是否越过屏幕分界线（只观测，不拦截）
+├── deskflow_autostart.py         ← 登录自启看门狗：保活 deskflow-core + 连上后拉起 clipwatch
+├── run-clipwatch.cmd             ← 带控制台启动（调试用）
+├── run-clipwatch-hidden.vbs      ← 无窗口后台启动（日常用）
+├── run-autostart.cmd             ← 看门狗带控制台启动
+├── run-autostart-hidden.vbs      ← 看门狗无窗口启动（登录自启走这条）
+├── agentbridge/                  ← 传输层文档 + 旧一代副本（**仅留档，勿直接使用**）
 │   ├── README.md                 ←   详解：连接信息 / 队列 / 命名约定 / 协议 v1+v2 / 排障
-│   ├── clipwatch.py              ←   常驻主程序（单进程）：
-│   │                                 出站轮询 + 剪贴板守护 + 投递箱监听
-│   │                                 + 协议 v2 直达推送接收器（监听 8900）
-│   ├── run-clipwatch.cmd         ←   带控制台启动（调试用）
-│   ├── run-clipwatch-hidden.vbs  ←   无窗口后台启动（日常用）
+│   ├── clipwatch.py              ←   ⚠ 2026-10-02 的旧一代副本，勿用；现行版本见 ../clipwatch.py
+│   ├── run-clipwatch.cmd         ←   ⚠ 与顶层同名文件相同，重复留档
+│   ├── run-clipwatch-hidden.vbs  ←   ⚠ 与顶层同名文件相同，重复留档
 │   ├── selftest_push.py          ←   协议 v2 接收器回归自检（26 项断言）
 │   ├── add_firewall_rule.ps1     ←   放行入站 8900（需一次管理员 UAC）
 │   └── verify_firewall_rule.ps1  ←   核验防火墙规则是否生效
