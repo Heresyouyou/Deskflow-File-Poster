@@ -52,7 +52,8 @@ IOS端/
 │   ├── 01-architecture.md        四层拆解 + 事件流 + 关键约束
 │   ├── 02-macos.md               macOS 实现细节与踩过的坑
 │   ├── 03-windows-port.md        Windows 逐层等价实现与硬门槛
-│   └── 04-deskflow-integration.md 如何真正合入 Deskflow
+│   ├── 04-deskflow-integration.md 如何真正合入 Deskflow
+│   └── 05-windows-iphone-use.md  给 Windows 端的交接：iPhone Use 能不能用、怎么替代
 ├── macos/                        Objective-C 实现（已跑通）
 │   ├── psagent.m                 守护进程：检测 App → 建屏 → 摆窗 → 接管光标
 │   ├── vdisplay.m                单独建虚拟屏（调试用）
