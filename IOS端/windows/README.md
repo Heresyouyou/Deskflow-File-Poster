@@ -1,45 +1,98 @@
-# Windows 侧（未实现）
+# Windows 侧 · 可编译的移植底座
 
-这个目录是占位。目前只有设计，没有可直接运行的代码——原因见 `../docs/03-windows-port.md`。
+这里不是"占位"了。平台无关的部分已经写成 C++17 并跑过单测，Windows 上要做的是
+**把外壳接上去**，而不是从零设计。
 
-## 缺什么
+从哪读起：先 `../docs/06-windows-handoff.md`（交接信 + 落地四步），再回来看这份文件。
 
-要补齐四层，只有一层是纯体力活：
+## 已经验证过的部分
 
-| 层 | 需要的东西 | 现状 |
-|---|---|---|
-| 虚拟屏 | 一个已签名的 IddCx 虚拟显示驱动 | 建议直接复用 Parsec VDD / spacedesk，不自研 |
-| 窗口 | `SetWindowPos` + `DwmGetWindowAttribute` | 两小时能写完 |
-| 光标 | `ShowCursor` + `SetWindowsHookEx(WH_MOUSE_LL)` | 需要小心计数配平 |
-| 注入 | WinRT `GattServiceProvider` 发布 HOGP | 取决于蓝牙适配器是否支持外设角色 |
-| 采集 | **无开源等价物** | 见文档，建议先用"盲控"方案 |
+在本机（macOS 14.8 / clang 15）实际编译运行，42 项断言全绿：
 
-## 建议的实现顺序
+```
+$ ./build.sh
+[hid] report map / payload
+[calibration] parse / lookup / tracking
+       收敛用 26 步
+[cursor] refcount balance
+[geometry] placement matches the verified macOS layout
 
-1. 装第三方虚拟显示驱动，验证光标能移进第二块屏；
-2. 写一个最小钩子程序，验证能吞掉该屏上的鼠标事件并算出相对位移；
-3. 用 WinRT 发布只含鼠标 Report 的 HOGP 服务，验证 iPhone 能配对并显示指针；
-4. 三步都通了，再考虑把它做成托盘常驻程序。
-
-前两步不依赖 iPhone，可以先用"把事件打印到控制台"验证；第三步不通就说明适配器不支持外设角色，换 USB 蓝牙适配器（CSR8510 一类支持双角色的）再试。
-
-## 接口边界
-
-如果要让 Windows 版和 macOS 版共用一套上层逻辑，建议先把这个接口定下来：
-
-```c
-// 与平台无关的"一块手机屏幕"抽象
-typedef struct {
-    int      (*open)(void);                       // 建立与手机的连接
-    void     (*close)(void);
-    int      (*screen_rect)(int *x, int *y, int *w, int *h);  // 朝外暴露画面区
-    void     (*hide_cursor)(int hidden);
-    int      (*send_relative)(int dx, int dy);    // 像素位移
-    int      (*send_key)(uint16_t usage, int down);
-} ios_screen_backend;
-
-// 平台侧只提供三件事
-ios_screen_backend *platform_backend(void);        // 造/拿虚拟屏 + 注入
+42 checks, 0 failed
 ```
 
-macOS 的 `psagent.m` 里那三层逻辑（几何闭环、光标配平、焦点策略）可以原样搬到这套接口之上，`docs/01-architecture.md` 的状态机也直接适用。
+| 文件 | 内容 | 验证方式 |
+|---|---|---|
+| `src/hid_reports.cpp` | 198 字节 HID Report Map、4 类报文编码 | 与上游 `HIDReports.swift` **逐字节比对**（`tests/expected_report_map.h` 由脚本从 Swift 源码生成） |
+| `src/calibration.cpp` | 33 档加速度曲线、反查、单步跟踪、归位 | 用真机校准文件跑收敛测试：从 (0,0) 到 (1179,2555) 用 26 步，终点误差 < 半档 |
+| `src/geometry.cpp` | 虚拟屏贴右缘、手机区定位 | 复现 macOS 上已验证的 `1680,125 393×852` |
+| `src/cursor_guard.cpp` | `ShowCursor` 引用计数配平 | 模拟计数器：进入/重复进入/离开/析构四路都验过 |
+
+**没有验证的部分**（本机无 Windows，无法编译）：
+
+- `src/main_win.cpp` —— Win32 外壳：枚举显示器、`ChangeDisplaySettingsEx` 摆位、
+  `WH_MOUSE_LL` 钩子、捕获状态机。逻辑完整，预计只需少量类型/包含修正。
+- `src/hogp_winrt.cpp` —— HOGP 发布端，**只有骨架**。它有明确的失败出口，不会假装成功。
+
+## 目录
+
+```
+windows/
+├── build.sh                  macOS/Linux 上验证核心（不依赖 cmake，作者跑过的命令）
+├── CMakeLists.txt            Windows 上用：cmake -S . -B build -A x64
+├── include/
+│   ├── hid_reports.h         报文与描述符的对外契约
+│   ├── calibration.h         曲线：px <-> report 档位
+│   ├── geometry.h            像素矩形与摆位
+│   ├── cursor_guard.h        ShowCursor 计数配平
+│   └── hid_sink.h            HID 出口接口 + DryRunSink
+├── src/
+│   ├── hid_reports.cpp       ← 已测
+│   ├── calibration.cpp       ← 已测
+│   ├── geometry.cpp          ← 已测
+│   ├── cursor_guard.cpp      ← 已测
+│   ├── main_win.cpp          ← 未编译
+│   └── hogp_winrt.cpp        ← 骨架
+└── tests/
+    ├── test_core.cpp         平台无关单测
+    └── expected_report_map.h 从上游源码生成的权威字节
+```
+
+## 怎么跑
+
+**任意平台验证核心**（30 秒）：
+
+```bash
+./build.sh
+```
+
+**Windows 构建**：
+
+```powershell
+cmake -S . -B build -A x64
+cmake --build build --config Release
+ctest --test-dir build -C Release
+```
+
+**Windows 上的三个自检命令**（按顺序，前一个不通不要做下一个）：
+
+```powershell
+.\build\Release\ios_screen.exe --list
+.\build\Release\ios_screen.exe --calibration cal.json --home --dry-run
+.\build\Release\ios_screen.exe --monitor "PSCCDD0" --calibration cal.json --dry-run
+```
+
+第三条跑起来后，把鼠标移进虚拟屏，控制台应开始按 30ms 节奏打印 `report id=3`，
+`dx/dy` 随移动方向和幅度变化。这一步通了，说明**几何 + 钩子 + 校准**三点都对，
+只剩蓝牙。
+
+## 校准文件从哪来
+
+Windows 自己量不出来（没有画面就没有反馈）。用 Mac 上已经量好的：
+
+```
+~/Library/Application Support/iPhoneUse/pointer-calibration/by-screen/<screenID>.json
+```
+
+本目录已带一份真机导出的 `calibration-iphone15pro.json`（iPhone 15 Pro，1180×2556），
+拷到 Windows 直接 `--calibration` 指定即可。曲线是 iOS 侧的行为，与是哪台电脑无关；
+但 **`reportInterval` 必须是 0.03**，改了就等于换了速度段，曲线失效。

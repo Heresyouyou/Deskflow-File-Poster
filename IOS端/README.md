@@ -9,8 +9,10 @@
 | 平台 | 状态 | 说明 |
 |---|---|---|
 | macOS | **已跑通** | `macos/` 下的实现，Intel + macOS 14 实测稳定 |
-| Windows | 仅设计 | 见 `docs/03-windows-port.md`，两层有硬门槛 |
+| Windows | **底座已移植** | 平台无关部分已写成 C++17 并通过 42 项单测；Win32 外壳与 HOGP 待实现，见 `docs/06-windows-handoff.md` |
 | Linux | 未验证 | 虚拟屏可用 Xvfb/Wayland 虚拟输出，HID 层可移植 |
+
+> Windows 端请直接读 **`docs/06-windows-handoff.md`**：那是开工单，不是评估报告。
 
 ---
 
@@ -53,13 +55,18 @@ IOS端/
 │   ├── 02-macos.md               macOS 实现细节与踩过的坑
 │   ├── 03-windows-port.md        Windows 逐层等价实现与硬门槛
 │   ├── 04-deskflow-integration.md 如何真正合入 Deskflow
-│   └── 05-windows-iphone-use.md  给 Windows 端的交接：iPhone Use 能不能用、怎么替代
+│   ├── 05-windows-iphone-use.md  给 Windows 端的交接：iPhone Use 能不能用、怎么替代
+│   └── 06-windows-handoff.md     Windows 重构开工单（读这份动手）
 ├── macos/                        Objective-C 实现（已跑通）
 │   ├── psagent.m                 守护进程：检测 App → 建屏 → 摆窗 → 接管光标
 │   ├── vdisplay.m                单独建虚拟屏（调试用）
 │   ├── phonescreen.m             单独摆窗口 / 桥接光标（调试用）
 │   └── ...
-├── windows/                      Windows 骨架（未实现）
+├── windows/                      C++ 移植底座
+│   ├── include/                  报文、校准、几何、光标计数的对外契约
+│   ├── src/                      四个已测核心 + main_win.cpp + hogp_winrt.cpp
+│   ├── tests/                    平台无关单测（42 项断言）
+│   └── build.sh                  不依赖 cmake 的验证命令
 └── protocol/                     iPhone Use 本地 HTTP 协议与校准格式
 ```
 
